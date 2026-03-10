@@ -1,0 +1,283 @@
+{
+  "tlog_path": "/home/npp-vlm/Dipan_EXP/UAV/telemetry_all_expected.tlog",
+  "total_messages": 368992,
+  "command_requests": 104,
+  "command_acks": 56,
+  "paired_sequences": 34,
+  "top_commands": [
+    [
+      512,
+      29
+    ],
+    [
+      400,
+      2
+    ],
+    [
+      22,
+      2
+    ],
+    [
+      401,
+      1
+    ]
+  ],
+  "ack_result_counts": {
+    "0": 14,
+    "2": 20
+  },
+  "example_sequence": {
+    "t_request": 1770833454.694,
+    "t_ack": 1770833454.707,
+    "dt_ack_s": 0.013,
+    "context_prev_heartbeat": null,
+    "request": {
+      "type": "COMMAND_LONG",
+      "command": 512,
+      "target_system": 1,
+      "target_component": 1,
+      "param1": 148.0,
+      "param2": 0.0,
+      "param3": 0.0,
+      "param4": 0.0,
+      "param5": 0.0,
+      "param6": 0.0,
+      "param7": 0.0
+    },
+    "ack": {
+      "type": "COMMAND_ACK",
+      "command": 512,
+      "result": 0,
+      "progress": 0,
+      "result_param2": 0
+    },
+    "followups": [
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0018232185393571854,
+        "vy": -0.002283360343426466,
+        "vz": 0.006444375496357679
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 193,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0017489662859588861,
+        "vy": -0.0022297545801848173,
+        "vz": 0.006485758814960718
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 193,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0017988369800150394,
+        "vy": -0.0021526776254177094,
+        "vz": 0.006547939032316208
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 193,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0017013143515214324,
+        "vy": -0.002087443368509412,
+        "vz": 0.006866196636110544
+      },
+      {
+        "type": "HEARTBEAT",
+        "base_mode": 192,
+        "custom_mode": 0,
+        "system_status": 4
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 192,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.001612731022760272,
+        "vy": -0.0020586340688169003,
+        "vz": 0.006988779176026583
+      },
+      {
+        "type": "HEARTBEAT",
+        "base_mode": 192,
+        "custom_mode": 0,
+        "system_status": 4
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 192,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0015806412557139993,
+        "vy": -0.0018473004456609488,
+        "vz": 0.007106522563844919
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 192,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.00157974474132061,
+        "vy": -0.0017144373850896955,
+        "vz": 0.00716026546433568
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 191,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0015890850918367505,
+        "vy": -0.0015689530409872532,
+        "vz": 0.007356664165854454
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 191,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0016066203825175762,
+        "vy": -0.0015133772976696491,
+        "vz": 0.00745547516271472
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 191,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0016010018298402429,
+        "vy": -0.0014081739354878664,
+        "vz": 0.007597917225211859
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 190,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "VFR_HUD",
+        "alt": 0.19061961770057678,
+        "airspeed": NaN,
+        "groundspeed": 0.0021225183736532927,
+        "throttle": 0,
+        "climb": -0.007672221399843693
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0016337891574949026,
+        "vy": -0.0013549232389777899,
+        "vz": 0.007672221399843693
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 190,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0017563989385962486,
+        "vy": -0.0013048902619630098,
+        "vz": 0.007736913859844208
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 190,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0017956063384190202,
+        "vy": -0.001341349328868091,
+        "vz": 0.007805655710399151
+      },
+      {
+        "type": "GLOBAL_POSITION_INT",
+        "lat": 473995307,
+        "lon": 85464987,
+        "alt": 189,
+        "vx": 0,
+        "vy": 0,
+        "vz": 0
+      },
+      {
+        "type": "LOCAL_POSITION_NED",
+        "vx": -0.0018265931867063046,
+        "vy": -0.0013842469779774547,
+        "vz": 0.007843200117349625
+      }
+    ]
+  },
+  "parameters": {
+    "pair_max_dt": 2.0,
+    "follow_window": 1.5,
+    "max_followups": 30
+  }
+}
