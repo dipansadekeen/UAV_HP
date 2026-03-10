@@ -1,1 +1,3 @@
 tests/api_key.txt
+tests/honeypot_2_without_state.py
+tests/honeypot_2.py
