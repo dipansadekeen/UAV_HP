@@ -94,7 +94,7 @@ class CommonState:
     # ------------------------
     voltage_battery: int = 12000          # mV
     current_battery: int = -1             # cA (10*mA). -1 = not measured
-    battery_remaining: int = 90           # %
+    battery_remaining: int = 100           # %
     load: int = 400                       # 0..1000
     onboard_control_sensors_present: int = 0
     onboard_control_sensors_enabled: int = 0
@@ -360,9 +360,6 @@ ACK_RESULT_MAP = {
 }
 #  ////// commands ends ///////
 
-
-
-
 # ============================================================
 # TIME UPDATE FUNCTION (from your code)
 # ============================================================
@@ -465,17 +462,29 @@ def make_vfr_hud(mav, s: CommonState):
         float(s.vfr_climb),
     )
 
+# new
+def make_battery_status(mav, s: CommonState):
+    return mav.battery_status_encode(
+        0,
+        0,
+        0,
+        0,
+        [4050, 4050, 4050, 4050, 65535, 65535, 65535, 65535, 65535, 65535],
+        -1,
+        -1,
+        -1,
+        int(s.battery_remaining)   # 👈 reuse existing value
+    )
+
 TELEM_BUILDERS = {
     "SYS_STATUS": make_sys_status,
     "GPS_RAW_INT": make_gps_raw_int,
     "GLOBAL_POSITION_INT": make_global_position_int,
     "ATTITUDE": make_attitude,
-    "VFR_HUD": make_vfr_hud
-    # HEARTBEAT stays in heartbeat_loop()
+    "VFR_HUD": make_vfr_hud,
+    "BATTERY_STATUS": make_battery_status, #new
 }
 # ////////// telemetry //////////
-
-
 
 # ////////////// for commands /////////////
 def load_rag_transitions(self, path: str) -> None:
@@ -1239,7 +1248,7 @@ class LLMHoneypot:
             return
         pkt = msg.pack(self.mav_out)
         self.sock.sendto(pkt, self.gcs_addr)
-        # print("[TX UDP dst]", self.gcs_addr, "bytes=", len(pkt), flush=True) #debug delete later dlt
+        # print(f"[SEND_MAV] dst={self.gcs_addr} bytes={len(pkt)}", flush=True)
 
     # ///////////////HEARTBEAT /////////////////////////
 
@@ -1254,10 +1263,10 @@ class LLMHoneypot:
     #  to make llm give heartbeat all the time ////////////////////////
                 # log last heartbeat snapshot (for LLM prompt)               
                 hb = make_heartbeat(self.mav_out, self.state)
-                print(
-                    "[HEARTBEAT TX]", "base_mode=", int(self.state.base_mode),
-                    "custom_mode=", int(self.state.custom_mode), "system_status=", int(self.state.system_status),
-                    "armed=", bool(self.state.base_mode & 0x80),flush=True) # debug delete later dlt
+                # print(
+                #     "[HEARTBEAT TX]", "base_mode=", int(self.state.base_mode),
+                #     "custom_mode=", int(self.state.custom_mode), "system_status=", int(self.state.system_status),
+                #     "armed=", bool(self.state.base_mode & 0x80),flush=True) # debug delete later dlt
 
                 self.send_mav(hb)
                 with self.state_lock: # log last 10 hb
@@ -1391,6 +1400,7 @@ class LLMHoneypot:
 
             with self.stream_lock:
                 items = list(self.streams.items())  # copy
+                # print("[ACTIVE STREAMS]", list(self.streams.keys()), flush=True) # new///
 
             for name, (rate_hz, next_send) in items:
                 if now < next_send:
@@ -1404,6 +1414,7 @@ class LLMHoneypot:
                     with self.state_lock:
                         msg = builder(self.mav_out, self.state)
                     self.send_mav(msg)
+                    # print(f"[TELEM TX] {name}", flush=True) # new///
                 except Exception as e:
                     print(f"[TELEM ERROR] {name}: {e}", flush=True)
                     continue
@@ -1515,6 +1526,18 @@ class LLMHoneypot:
 
             # ////////////////////// telemetry ///////////////////////
 
+    # send telemetry helpers # new///
+    def enable_default_telem_streams(self):
+        now = time.monotonic()
+        with self.stream_lock:
+            self.streams["SYS_STATUS"] = [5.0, now]
+            self.streams["GPS_RAW_INT"] = [1.0, now]
+            self.streams["GLOBAL_POSITION_INT"] = [5.0, now]
+            self.streams["ATTITUDE"] = [10.0, now]
+            self.streams["VFR_HUD"] = [5.0, now]
+            self.streams["BATTERY_STATUS"] = [2.0, now] #new
+
+        print("[DEFAULT STREAMS ENABLED]", list(self.streams.keys()), flush=True)
 
 
     # //////////////////////QGC ///////////////////////
@@ -1568,13 +1591,26 @@ class LLMHoneypot:
     - roll, pitch, yaw: radians
     """
     # new ///
-    def call_ollama_cloud(self, system_text: str, user_text: str, tag: str = "") -> str:
-        import requests, time
+    def call_ollama_cloud(self, system_text: str, user_text: str, tag: str = "general") -> str:
+        t0 = time.monotonic()
 
-        start = time.time()
         try:
             with open("api_key.txt", "r") as f:
                 api_key = f.read().strip()
+
+            payload = {
+                "model": "gpt-oss:20b-cloud",
+                "messages": [
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_text}
+                ],
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": 0,
+                    "top_p": 0.9
+                }
+            }
 
             r = requests.post(
                 "https://ollama.com/api/chat",
@@ -1582,18 +1618,7 @@ class LLMHoneypot:
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
                 },
-                json={
-                    "model": "gpt-oss:20b-cloud",
-                    "messages": [
-                        {"role": "system", "content": system_text},
-                        {"role": "user", "content": user_text}
-                    ],
-                    "stream": False,
-                    "options": {
-                        "temperature": 0,
-                        "top_p": 0.9
-                    }
-                },
+                json=payload,
                 timeout=360
             )
 
@@ -1602,8 +1627,13 @@ class LLMHoneypot:
 
             r.raise_for_status()
 
-            print(f"[LLM CLOUD {tag}] latency {time.time() - start:.2f}s", flush=True)
-            return r.json().get("message", {}).get("content", "").strip()
+            raw = r.json()["message"]["content"]
+            dt_ms = (time.monotonic() - t0) * 1000.0
+
+            parsed = extract_json(raw)
+            self.log_llm_io(tag, system_text, user_text, raw, parsed, dt_ms)
+
+            return raw
 
         except Exception as e:
             print(f"[LLM CLOUD FAIL {tag}] {e}", flush=True)
@@ -2027,13 +2057,13 @@ class LLMHoneypot:
 
         try:
             print("\n[HB LLM USER PROMPT]")
-            print(user_text, flush=True)
+            print(user_text, flush=True) # view llm prompt
 
             raw = self.call_ollama(system_text, user_text, tag="heartbeat_command")
             parsed = extract_json(raw)
 
             print("\n[HB LLM RAW RESPONSE]")
-            print(raw, flush=True)
+            print(raw, flush=True) # view llm prompt
 
             if not parsed:
                 print("[HB LLM] JSON parse failed", flush=True)
@@ -2185,41 +2215,43 @@ class LLMHoneypot:
         print("[--DEBUG--] sequence_examples =", len(sequence_examples))
         
         system_text = """
-You are a MAVLink telemetry predictor for a drone honeypot.
+        You are a MAVLink telemetry predictor for a drone honeypot.
 
-You are given:
-- the current command
-- the current heartbeat
-- the last 5 live telemetry snapshots
-- transition examples from past traces
-- short future telemetry examples from past traces
-- the allowed telemetry schema
+        You are given:
+        - the current command
+        - the current heartbeat
+        - the last 5 live telemetry snapshots
+        - transition examples from past traces
+        - short future telemetry examples from past traces
+        - the allowed telemetry schema
+        - always generate the battery remaining
+        - your alt will change for taking off or landing
 
-Your task:
-- generate the next 5 telemetry states after this command
-- use only canonical MAVLink telemetry names
-- group telemetry by MAVLink message name
-- follow the allowed telemetry schema exactly
+        Your task:
+        - generate the next 5 telemetry states after this command
+        - use only canonical MAVLink telemetry names
+        - group telemetry by MAVLink message name
+        - follow the allowed telemetry schema exactly
 
-Return ONLY valid JSON in exactly this format:
-{
-  "telemetry_series": [
-    {"dt": 0.0, "fields": {}},
-    {"dt": 0.1, "fields": {}},
-    {"dt": 0.2, "fields": {}},
-    {"dt": 0.3, "fields": {}},
-    {"dt": 0.4, "fields": {}}
-  ],
-  "reason": "<short>"
-}
+        Return ONLY valid JSON in exactly this format:
+        {
+        "telemetry_series": [
+            {"dt": 0.0, "fields": {}},
+            {"dt": 0.1, "fields": {}},
+            {"dt": 0.2, "fields": {}},
+            {"dt": 0.3, "fields": {}},
+            {"dt": 0.4, "fields": {}}
+        ],
+        "reason": "<short>"
+        }
 
-Rules:
-- Only use message groups and fields defined in allowed_telemetry_groups.
-- Do not use internal/private variable names.
-- Keep changes smooth and realistic.
-- If a field is not needed, omit it.
-- Return JSON only.
-""".strip()
+        Rules:
+        - Only use message groups and fields defined in allowed_telemetry_groups.
+        - Do not use internal/private variable names.
+        - Keep changes smooth and realistic.
+        - If a field is not needed, omit it.
+        - Return JSON only.
+        """.strip()
         user_payload = {
             "command": {
                 "id": int(command_id),
@@ -2244,11 +2276,11 @@ Rules:
         user_text = json.dumps(user_payload)
 
         try:
-            print("\n[TELEM LLM USER PROMPT]")
-            print(user_text, flush=True)
+            # print("\n[TELEM LLM USER PROMPT]")
+            # print(user_text, flush=True) # view LLM prompt
 
-            raw = self.call_ollama(system_text, user_text, tag="telemetry_command")
-            # raw = self.call_ollama_cloud(system_text, user_text, tag="telemetry_command")
+            # raw = self.call_ollama(system_text, user_text, tag="telemetry_command")
+            raw = self.call_ollama_cloud(system_text, user_text, tag="telemetry_command")
             parsed = extract_json(raw)
 
             print("\n[TELEM LLM RAW RESPONSE]")
@@ -2469,9 +2501,62 @@ Rules:
                     )
                 self.send_mav(ack)
                 return
-
             # ---------------------------
-            # B2) Other commands (ARM/DISARM/TAKEOFF/etc.)
+            # B2) Request handling #new///
+            # ---------------------------
+            if cmd == mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE:
+                requested_msg_id = int(round(float(getattr(msg, "param1", -1.0))))
+                requested_name = self._msg_name_from_id(requested_msg_id)
+
+                print(f"[REQ MESSAGE] msg_id={requested_msg_id} name={requested_name}", flush=True)
+
+                if requested_name == "HEARTBEAT":
+                    with self.state_lock:
+                        update_time_fields(self.state, self.boot_time)
+                        out_msg = make_heartbeat(self.mav_out, self.state)
+
+                    self.send_mav(out_msg)
+                    print("[REQ MESSAGE SENT] HEARTBEAT", flush=True)
+
+                    ack = self.mav_out.command_ack_encode(
+                        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                        mavutil.mavlink.MAV_RESULT_ACCEPTED
+                    )
+                    self.send_mav(ack)
+                    return
+
+                builder = TELEM_BUILDERS.get(requested_name)
+                if builder:
+                    try:
+                        with self.state_lock:
+                            update_time_fields(self.state, self.boot_time)
+                            out_msg = builder(self.mav_out, self.state)
+
+                        self.send_mav(out_msg)
+                        print(f"[REQ MESSAGE SENT] {requested_name}", flush=True)
+
+                        ack = self.mav_out.command_ack_encode(
+                            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                            mavutil.mavlink.MAV_RESULT_ACCEPTED
+                        )
+                        self.send_mav(ack)
+                    except Exception as e:
+                        print(f"[REQ MESSAGE ERROR] msg_id={requested_msg_id} name={requested_name} err={e}", flush=True)
+                        ack = self.mav_out.command_ack_encode(
+                            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                            mavutil.mavlink.MAV_RESULT_UNSUPPORTED
+                        )
+                        self.send_mav(ack)
+                else:
+                    print(f"[REQ MESSAGE UNSUPPORTED] msg_id={requested_msg_id} name={requested_name}", flush=True)
+                    ack = self.mav_out.command_ack_encode(
+                        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                        mavutil.mavlink.MAV_RESULT_UNSUPPORTED
+                    )
+                    self.send_mav(ack)
+                return
+            # ---------------------------
+            # B3) Other commands (ARM/DISARM/TAKEOFF/etc.)
             # ---------------------------
 
             # --- B2) All other commands: route to LLM command pipeline ---
@@ -2487,6 +2572,10 @@ Rules:
 
             # ---- NEW: rule-based ACK ----
             result, reason= rule_based_ack(cmd, params, self.state)
+            
+            result_name = mavutil.mavlink.enums["MAV_RESULT"][int(result)].name #debug
+            print(f"[ACK RULE] cmd={cmd} result={result_name} reason={reason}", flush=True) #debug
+
 
             # ack_msg = self.mav_out.command_ack_encode(cmd, result) #commented for ack handling
             # self.send_mav(ack_msg) #commented for ack handling
@@ -2501,17 +2590,22 @@ Rules:
             # self.send_mav(ack_msg)
 
             # //// delete below if fails
-            try:
-                # old pymavlink signature (only command, result)
-                ack_msg = self.mav_out.command_ack_encode(int(cmd), int(result))
-            except TypeError:
-                # newer message shape with target fields
-                ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
-                    int(cmd), int(result), 0, 0, int(ts), int(tc)
-                )
-            self.send_mav(ack_msg)
+            # try:
+            #     # old pymavlink signature (only command, result)
+            #     ack_msg = self.mav_out.command_ack_encode(int(cmd), int(result))
+            # except TypeError:
+            #     # newer message shape with target fields
+            #     ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
+            #         int(cmd), int(result), 0, 0, int(ts), int(tc)
+            #     )
+            # self.send_mav(ack_msg)
             # //// delete above if fails
 
+            ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
+                int(cmd), int(result)
+            )
+            print(f"[ACK TX] cmd={cmd} result={result}", flush=True)
+            self.send_mav(ack_msg)          
 
             #  pending: log the ack as well:
 
@@ -2560,6 +2654,12 @@ Rules:
 
             # return
             # /////////////////////////////////////////////////////
+            skip_llm = lambda c: c in {521}
+
+            if skip_llm(cmd):
+                print(f"[LLM SKIP] cmd={cmd}", flush=True)
+                return
+                #the above skip_llm is supposed to stop bogus functions affecting the llm response.
 
             # 1) heartbeat-only LLM module
             hb_resp = self.handle_command_heartbeat(cmd, params)
@@ -2611,11 +2711,12 @@ Rules:
 
         # 3️⃣ Start request-driven telemetry scheduler
         self.telemetry_thread.start()
+        self.enable_default_telem_streams() # new ///
 
         while True:
             try:
                 data, addr = self.sock.recvfrom(4096)
-                print("[RX UDP addr]", addr, "len=", len(data), flush=True) ##debug dlt later
+                # print("[RX UDP addr]", addr, "len=", len(data), flush=True) ##debug dlt later
             except socket.timeout:
                 continue
 
