@@ -1222,6 +1222,16 @@ class LLMHoneypot:
 
         self.cmd_transition_rows = load_command_rag_jsonl("../out/cmd_transition.jsonl")
 
+        # ---- CONTINUATION STATE ---- # new 2 --telemety patch
+        self.continuation_enabled = False
+        self.continuation_inflight = False
+        self.last_action_cmd = None
+        self.last_action_params = None
+
+        self.no_continuation_cmds = {512, 521} #cmd ignore
+
+    
+
     # //////// command helpers ///////
 
     def log_llm_io(self, tag: str, system_text: str, user_text: str, raw: str, parsed: dict, latency_ms: float):
@@ -1855,8 +1865,8 @@ class LLMHoneypot:
         hist = self.hist.snapshot()
 
         # fewshot = rag_retrieve_examples(self.command_rag_rows, command_id, k=3)
-        fewshot_trace = rag_retrieve_examples(self.cmd_trace_rows, command_id, k=2)
-        fewshot_seq   = rag_retrieve_examples(self.cmd_seq_rows, command_id, k=2)
+        fewshot_trace = rag_retrieve_examples(self.cmd_trace_rows, command_id, k=5)
+        fewshot_seq   = rag_retrieve_examples(self.cmd_seq_rows, command_id, k=5)
 
         fewshot = {
             "trace_examples": fewshot_trace,
@@ -2612,6 +2622,9 @@ class LLMHoneypot:
 
             # log command into history (so LLM sees it next time)
             self.hist.add_cmd(cmd, params)
+
+
+
 
             # minimal runtime log (easy to see in terminal)
             print(f"[CMD RX] id={cmd} params={params}", flush=True)
