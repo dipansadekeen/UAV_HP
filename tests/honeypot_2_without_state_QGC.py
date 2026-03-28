@@ -616,19 +616,98 @@ def extract_heartbeat_transition_examples(rows: List[Dict[str, Any]], command_id
     return out
 
 
+# def retrieve_heartbeat_examples_from_sequences(rows: List[Dict[str, Any]], command_id: int, k: int = 2) -> List[Dict[str, Any]]:
+#     """
+#     Retrieve heartbeat transition examples from px4_command_sequences.jsonl.
+
+#     Expected sequence row structure:
+#       {
+#         "context_prev_heartbeat": {...},
+#         "request": {...},
+#         "ack": {...},
+#         "followups": [...]
+#       }
+#     """
+
+#     out = []
+
+#     def compact_hb(hb: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+#         if not isinstance(hb, dict):
+#             return None
+#         return {
+#             "base_mode": hb.get("base_mode"),
+#             "custom_mode": hb.get("custom_mode"),
+#             "system_status": hb.get("system_status"),
+#             "type": hb.get("type"),
+#             "autopilot": hb.get("autopilot"),
+#             "mavlink_version": hb.get("mavlink_version"),
+#             "_ts": hb.get("_ts"),
+#         }
+
+#     def compact_request(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+#         if not isinstance(req, dict):
+#             return None
+#         return {
+#             "command": req.get("command"),
+#             "param1": req.get("param1"),
+#             "param2": req.get("param2"),
+#             "param3": req.get("param3"),
+#             "param4": req.get("param4"),
+#             "param5": req.get("param5"),
+#             "param6": req.get("param6"),
+#             "param7": req.get("param7"),
+#             "_ts": req.get("_ts"),
+#         }
+
+#     def compact_ack(ack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+#         if not isinstance(ack, dict):
+#             return None
+#         return {
+#             "command": ack.get("command"),
+#             "result": ack.get("result"),
+#             "progress": ack.get("progress"),
+#             "result_param2": ack.get("result_param2"),
+#             "_ts": ack.get("_ts"),
+#         }
+
+#     def first_followup_heartbeat(followups: Any) -> Optional[Dict[str, Any]]:
+#         if not isinstance(followups, list):
+#             return None
+#         for item in followups:
+#             if not isinstance(item, dict):
+#                 continue
+#             mtype = str(item.get("mavpackettype") or item.get("_type") or "").upper()
+#             if mtype == "HEARTBEAT":
+#                 return compact_hb(item)
+#         return None
+
+#     for row in rows:
+#         if not isinstance(row, dict):
+#             continue
+
+#         req = row.get("request", {})
+#         try:
+#             req_cmd = int(req.get("command", -1))
+#         except Exception:
+#             continue
+
+#         if req_cmd != int(command_id):
+#             continue
+
+#         ex = {
+#             "command": compact_request(req),
+#             "prev_heartbeat": compact_hb(row.get("context_prev_heartbeat")),
+#             "ack": compact_ack(row.get("ack")),
+#             "next_heartbeat": first_followup_heartbeat(row.get("followups", [])),
+#         }
+
+#         out.append(ex)
+
+#         if len(out) >= k:
+#             break
+
+#     return out
 def retrieve_heartbeat_examples_from_sequences(rows: List[Dict[str, Any]], command_id: int, k: int = 2) -> List[Dict[str, Any]]:
-    """
-    Retrieve heartbeat transition examples from px4_command_sequences.jsonl.
-
-    Expected sequence row structure:
-      {
-        "context_prev_heartbeat": {...},
-        "request": {...},
-        "ack": {...},
-        "followups": [...]
-      }
-    """
-
     out = []
 
     def compact_hb(hb: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -638,7 +717,7 @@ def retrieve_heartbeat_examples_from_sequences(rows: List[Dict[str, Any]], comma
             "base_mode": hb.get("base_mode"),
             "custom_mode": hb.get("custom_mode"),
             "system_status": hb.get("system_status"),
-            "type": hb.get("type"),
+            "type": hb.get("type") or hb.get("mavpackettype") or hb.get("_type"),
             "autopilot": hb.get("autopilot"),
             "mavlink_version": hb.get("mavlink_version"),
             "_ts": hb.get("_ts"),
@@ -673,12 +752,21 @@ def retrieve_heartbeat_examples_from_sequences(rows: List[Dict[str, Any]], comma
     def first_followup_heartbeat(followups: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(followups, list):
             return None
+
         for item in followups:
             if not isinstance(item, dict):
                 continue
-            mtype = str(item.get("mavpackettype") or item.get("_type") or "").upper()
+
+            mtype = str(
+                item.get("type") or
+                item.get("mavpackettype") or
+                item.get("_type") or
+                ""
+            ).upper()
+
             if mtype == "HEARTBEAT":
                 return compact_hb(item)
+
         return None
 
     for row in rows:
@@ -686,6 +774,9 @@ def retrieve_heartbeat_examples_from_sequences(rows: List[Dict[str, Any]], comma
             continue
 
         req = row.get("request", {})
+        if not isinstance(req, dict):
+            continue
+
         try:
             req_cmd = int(req.get("command", -1))
         except Exception:
@@ -1298,13 +1389,42 @@ class LLMHoneypot:
                     setattr(self.state, k, v)
 
             print("[HEARTBEAT] Identity initialized by LLM")
-            # print("[DEBUG] Initial HB State:",
-            #     self.state.hb_type,
-            #     self.state.hb_autopilot,
-            #     self.state.base_mode,
-            #     self.state.system_status)
-            # self.identity_locked = True
+            print("[DEBUG] Initial HB State:",
+                self.state.hb_type,
+                self.state.hb_autopilot,
+                self.state.base_mode,
+                self.state.system_status)
+            self.identity_locked = True
 
+    # static HB        
+    # def initialize_heartbeat_identity(self):
+    #     """
+    #     Initialize heartbeat identity safely at startup.
+    #     LLM is not allowed to invent startup heartbeat bits.
+    #     """
+
+    #     with self.state_lock:
+    #         # identity
+    #         self.state.hb_type = mavutil.mavlink.MAV_TYPE_QUADROTOR
+    #         self.state.hb_autopilot = mavutil.mavlink.MAV_AUTOPILOT_PX4
+    #         self.state.mavlink_version = 3
+
+    #         # startup heartbeat state
+    #         self.state.base_mode = 65
+    #         self.state.custom_mode = 0
+    #         self.state.system_status = 3
+
+    #     print("[HEARTBEAT] Identity initialized safely")
+    #     print(
+    #         "[DEBUG] Initial HB State:",
+    #         self.state.hb_type,
+    #         self.state.hb_autopilot,
+    #         self.state.base_mode,
+    #         self.state.custom_mode,
+    #         self.state.system_status,
+    #     )
+
+    #     self.identity_locked = True
 
     # ////////////////////// telemetry ///////////////////////
 
@@ -1865,8 +1985,8 @@ class LLMHoneypot:
         hist = self.hist.snapshot()
 
         # fewshot = rag_retrieve_examples(self.command_rag_rows, command_id, k=3)
-        fewshot_trace = rag_retrieve_examples(self.cmd_trace_rows, command_id, k=5)
-        fewshot_seq   = rag_retrieve_examples(self.cmd_seq_rows, command_id, k=5)
+        fewshot_trace = rag_retrieve_examples(self.cmd_trace_rows, command_id, k=2)
+        fewshot_seq   = rag_retrieve_examples(self.cmd_seq_rows, command_id, k=2)
 
         fewshot = {
             "trace_examples": fewshot_trace,
@@ -1989,7 +2109,7 @@ class LLMHoneypot:
         Side effect:
         - applies heartbeat patch once if valid
         """
-        fewshot_seq = retrieve_heartbeat_examples_from_sequences(self.cmd_seq_rows, command_id, k=2)
+        fewshot_seq = retrieve_heartbeat_examples_from_sequences(self.cmd_seq_rows, command_id, k=5)
         fewshot_trace = []   # keep trace disabled for heartbeat for now
         # 1) collect only previous heartbeat
         with self.state_lock:
@@ -2069,7 +2189,8 @@ class LLMHoneypot:
             print("\n[HB LLM USER PROMPT]")
             print(user_text, flush=True) # view llm prompt
 
-            raw = self.call_ollama(system_text, user_text, tag="heartbeat_command")
+            # raw = self.call_ollama(system_text, user_text, tag="heartbeat_command")
+            raw = self.call_ollama_cloud(system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
             parsed = extract_json(raw)
 
             print("\n[HB LLM RAW RESPONSE]")
@@ -2286,8 +2407,8 @@ class LLMHoneypot:
         user_text = json.dumps(user_payload)
 
         try:
-            # print("\n[TELEM LLM USER PROMPT]")
-            # print(user_text, flush=True) # view LLM prompt
+            print("\n[TELEM LLM USER PROMPT]")
+            print(user_text, flush=True) # view LLM prompt
 
             # raw = self.call_ollama(system_text, user_text, tag="telemetry_command")
             raw = self.call_ollama_cloud(system_text, user_text, tag="telemetry_command")
