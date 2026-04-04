@@ -1,11 +1,14 @@
 
 The codebase in tests utilizes four modules.
 module_main.py --> The final module to utilize all other submodules
+
 module_llmhoneypot.py --> the main module that connects, generates heartbeats and telemetry and provides UAV next step of responses
+
 module_historybuffer_commonstate.py --> the module which contains the variable history and the variables for LLM to 'get previous context'
+
 module_helper_functions.py --> this module majorly contains all other supporting functions for the honeypot design.
 
-module_llmhoneypot.py
+Most Important: module_llmhoneypot.py
 It initiates the connection to the QGC/GCS and transmits responses as requested.
 
 The main development surrounds: it contains the structure to design effective LLM instructions to generate next steps of the movement.
