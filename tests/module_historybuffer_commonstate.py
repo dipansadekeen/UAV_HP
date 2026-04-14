@@ -85,8 +85,8 @@ class CommonState:
     # GPS_RAW_INT
     # ------------------------
     gps_time_usec: int = 0                 # can mirror time_usec
-    gps_lat: int = 0                       # 1e7 deg
-    gps_lon: int = 0                       # 1e7 deg
+    gps_lat: int = 473979709                       # 1e7 deg
+    gps_lon: int = 85461637                       # 1e7 deg
     gps_alt: int = 0                       # mm (MSL)
     gps_alt_ellipsoid: int = 0             # mm
     gps_fix_type: int = 3
@@ -105,8 +105,8 @@ class CommonState:
     # GLOBAL_POSITION_INT
     # ------------------------
     gpi_time_boot_ms: int = 0
-    gpi_lat: int = 0
-    gpi_lon: int = 0
+    gpi_lat: int = 473979709
+    gpi_lon: int = 85461637
     gpi_alt: int = 0                       # mm
     gpi_relative_alt: int = 0              # mm
     gpi_vx: int = 0                        # cm/s
@@ -217,6 +217,14 @@ class CommonState:
     servo_time_usec: int = 0
     servo_port: int = 0
     servo_raw: Tuple[int, ...] = (1500,) * 16  # servo1..servo16
+
+    # ------------------------
+    # Home POSITION
+    # ------------------------
+    home_initialized: bool = False
+    home_lat: int = 0
+    home_lon: int = 0
+    home_alt: int = 0
 
 
 # /////////// commands /////////////

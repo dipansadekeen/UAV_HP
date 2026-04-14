@@ -25,7 +25,7 @@ from module_helper_functions import (
     TELEM_GROUPS_SET,
     rule_based_ack,
 )
-
+from module_mission import *
 
 class LLMHoneypot:
 
@@ -76,12 +76,15 @@ class LLMHoneypot:
         self.hist = HistoryBuffer(max_hb=10, max_telem=10, max_cmd=10)
 
         # --- command rag (mounted file path from your upload) ---
-        self.cmd_trace_rows = load_command_rag_jsonl("../out/px4_command_trace.jsonl")
+        # self.cmd_trace_rows = load_command_rag_jsonl("../out/px4_command_trace.jsonl")
         self.cmd_seq_rows   = load_command_rag_jsonl("../out/px4_command_sequences.jsonl")
 
         # --- telemetry override queue (10-step series after a command) ---
         self.override_lock = threading.Lock()
         self.override_series = deque()  # each item: {"apply_at": float_monotonic, "fields": {...}}
+
+        # telem patch | trigger when 5 left
+        self.regen_in_progress = False
 
 
         # ////////// for QGC
@@ -96,17 +99,31 @@ class LLMHoneypot:
         # ////////// for QGC
 
 
-        self.cmd_transition_rows = load_command_rag_jsonl("../out/cmd_transition.jsonl")
+        self.cmd_transition_rows = load_command_rag_jsonl("../out/cmd_transition.jsonl") #
+        # self.cmd_transition_rows = load_command_rag_jsonl("../out/check.jsonl") #temporary
 
-        # ---- CONTINUATION STATE ---- # new 2 --telemety patch
-        self.continuation_enabled = False
-        self.continuation_inflight = False
-        self.last_action_cmd = None
-        self.last_action_params = None
+
+        # ---- CONTINUATION STATE ---- # new 2 --telemety patch 
+        self.active_cmd = None
+        self.active_params = None
 
         self.no_continuation_cmds = {512, 521} #cmd ignore
 
-    
+        # the - mission
+        init_mission_state(self)
+
+    # to translate the commands # example: name : MAV_CMD_COMPONENT_ARM_DISARM -- giving enums to the model
+    def get_command_name(self, command_id: int) -> str:
+        """
+        Convert MAVLink command id to enum name, e.g. 400 -> MAV_CMD_COMPONENT_ARM_DISARM
+        """
+        try:
+            enum_entry = mavutil.mavlink.enums["MAV_CMD"].get(int(command_id))
+            if enum_entry is not None:
+                return str(enum_entry.name)
+        except Exception:
+            pass
+        return f"UNKNOWN_MAV_CMD_{int(command_id)}"
 
     # //////// command helpers ///////
 
@@ -179,7 +196,47 @@ class LLMHoneypot:
             #     self.state.hb_autopilot,
             #     self.state.base_mode,
             #     self.state.system_status)
-            # self.identity_locked = True
+            self.identity_locked = True
+            print("[HEARTBEAT] Identity initialized safely")
+            print(
+                "[DEBUG] Initial HB State:",
+                self.state.hb_type,
+                self.state.hb_autopilot,
+                self.state.base_mode,
+                self.state.custom_mode,
+                self.state.system_status,
+            )
+
+
+    # # static HB        
+    # def initialize_heartbeat_identity(self):
+    #     """
+    #     Initialize heartbeat identity safely at startup.
+    #     LLM is not allowed to invent startup heartbeat bits.
+    #     """
+
+    #     with self.state_lock:
+    #         # identity
+    #         self.state.hb_type = mavutil.mavlink.MAV_TYPE_QUADROTOR
+    #         self.state.hb_autopilot = mavutil.mavlink.MAV_AUTOPILOT_PX4
+    #         self.state.mavlink_version = 3
+
+    #         # startup heartbeat state
+    #         self.state.base_mode = 29
+    #         self.state.custom_mode = 50593792
+    #         self.state.system_status = 4
+
+    #     print("[HEARTBEAT] Identity initialized safely")
+    #     print(
+    #         "[DEBUG] Initial HB State:",
+    #         self.state.hb_type,
+    #         self.state.hb_autopilot,
+    #         self.state.base_mode,
+    #         self.state.custom_mode,
+    #         self.state.system_status,
+    #     )
+
+    #     self.identity_locked = True
 
 
     # ////////////////////// telemetry ///////////////////////
@@ -282,6 +339,34 @@ class LLMHoneypot:
                             if hasattr(self.state, k):
                                 setattr(self.state, k, v)
 
+            # # new 2 | telemetry patch
+            # # need_continue = False
+            # # with self.override_lock:
+            # #     if not self.override_series and self.active_cmd is not None:
+            # #         need_continue = True
+
+            # # if need_continue:
+            # #     self.handle_command_telemetry(self.active_cmd, self.active_params)
+
+            # # ---- controlled regeneration ----
+            # need_regen = False
+            # with self.override_lock:
+            #     if (
+            #         self.active_cmd is not None
+            #         and len(self.override_series) == 0    #<= 2
+            #         and not self.regen_in_progress
+            #     ):
+            #         self.regen_in_progress = True
+            #         need_regen = True
+
+            # if need_regen:
+            #     self.handle_command_telemetry(self.active_cmd, self.active_params)
+            #     with self.override_lock:
+            #         self.regen_in_progress = False
+            # # ---- controlled regeneration ----
+            # # # new 2 | telemetry patch
+
+
             # ///////////// Apply queued telemetry “command impact” inside
 
             with self.stream_lock:
@@ -304,59 +389,6 @@ class LLMHoneypot:
                 except Exception as e:
                     print(f"[TELEM ERROR] {name}: {e}", flush=True)
                     continue
-
-                # after you successfully send a telemetry message, log what you sent (from state fields relevant to that message):
-                # log telemetry snapshot (minimal fields per message type)
-                # with self.state_lock:
-                #     if name == "SYS_STATUS":
-                #         self.hist.add_telem(name, {
-                #             "voltage_battery": self.state.voltage_battery,
-                #             "current_battery": self.state.current_battery,
-                #             "battery_remaining": self.state.battery_remaining,
-                #             "load": self.state.load,
-                #         })
-                #     elif name == "GPS_RAW_INT":
-                #         self.hist.add_telem(name, {
-                #             "time_usec": self.state.time_usec,
-                #             "gps_fix_type": self.state.gps_fix_type,
-                #             "gps_lat": self.state.gps_lat,
-                #             "gps_lon": self.state.gps_lon,
-                #             "gps_alt": self.state.gps_alt,
-                #             "gps_vel": self.state.gps_vel,
-                #             "gps_cog": self.state.gps_cog,
-                #             "gps_satellites_visible": self.state.gps_satellites_visible,
-                #         })
-                #     elif name == "GLOBAL_POSITION_INT":
-                #         self.hist.add_telem(name, {
-                #             "time_boot_ms": self.state.time_boot_ms,
-                #             "gpi_lat": self.state.gpi_lat,
-                #             "gpi_lon": self.state.gpi_lon,
-                #             "gpi_alt": self.state.gpi_alt,
-                #             "gpi_relative_alt": self.state.gpi_relative_alt,
-                #             "gpi_vx": self.state.gpi_vx,
-                #             "gpi_vy": self.state.gpi_vy,
-                #             "gpi_vz": self.state.gpi_vz,
-                #             "gpi_hdg": self.state.gpi_hdg,
-                #         })
-                #     elif name == "ATTITUDE":
-                #         self.hist.add_telem(name, {
-                #             "time_boot_ms": self.state.time_boot_ms,
-                #             "roll": self.state.roll,
-                #             "pitch": self.state.pitch,
-                #             "yaw": self.state.yaw,
-                #             "rollspeed": self.state.rollspeed,
-                #             "pitchspeed": self.state.pitchspeed,
-                #             "yawspeed": self.state.yawspeed,
-                #         })
-                #     elif name == "VFR_HUD":
-                #         self.hist.add_telem(name, {
-                #             "vfr_airspeed": self.state.vfr_airspeed,
-                #             "vfr_groundspeed": self.state.vfr_groundspeed,
-                #             "vfr_heading": self.state.vfr_heading,
-                #             "vfr_throttle": self.state.vfr_throttle,
-                #             "vfr_alt": self.state.vfr_alt,
-                #             "vfr_climb": self.state.vfr_climb,
-                #         })
 
                 # ///// new part
                 # log telemetry snapshot AFTER successful send
@@ -422,6 +454,7 @@ class LLMHoneypot:
             self.streams["ATTITUDE"] = [10.0, now]
             self.streams["VFR_HUD"] = [5.0, now]
             self.streams["BATTERY_STATUS"] = [2.0, now] #new
+            self.streams["MISSION_CURRENT"] = [2.0, now] # current mission # new
 
         print("[DEFAULT STREAMS ENABLED]", list(self.streams.keys()), flush=True)
 
@@ -741,7 +774,7 @@ class LLMHoneypot:
         hist = self.hist.snapshot()
 
         # fewshot = rag_retrieve_examples(self.command_rag_rows, command_id, k=3)
-        fewshot_trace = rag_retrieve_examples(self.cmd_trace_rows, command_id, k=2)
+        fewshot_trace = rag_retrieve_examples(self.cmd_trace_rows, command_id, k=2) # changed
         fewshot_seq   = rag_retrieve_examples(self.cmd_seq_rows, command_id, k=2)
 
         fewshot = {
@@ -881,6 +914,7 @@ class LLMHoneypot:
         # Optional telemetry context for later
         # last_telem = self.hist.snapshot().get("last_telemetry", [])
         # last_telem = last_telem[-1] if last_telem else None
+        # cmd_name = self.get_command_name(command_id)
 
         system_text = """
         You are a MAVLink heartbeat patch generator for a drone honeypot.
@@ -920,6 +954,7 @@ class LLMHoneypot:
         user_payload = {
             "command": {
                 "id": int(command_id),
+                # "name": cmd_name,
                 "params": {
                     "param1": float(params.get("param1", 0.0)),
                     "param2": float(params.get("param2", 0.0)),
@@ -945,8 +980,8 @@ class LLMHoneypot:
             print("\n[HB LLM USER PROMPT]")
             print(user_text, flush=True) # view llm prompt
 
-            # raw = self.call_ollama(system_text, user_text, tag="heartbeat_command")
-            raw = self.call_ollama_cloud(system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
+            raw = self.call_ollama(system_text, user_text, tag="heartbeat_command")
+            # raw = self.call_ollama_cloud(system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
             parsed = extract_json(raw)
 
             print("\n[HB LLM RAW RESPONSE]")
@@ -1100,25 +1135,67 @@ class LLMHoneypot:
         print("[--DEBUG--] last_5_telemetry_count =", len(last_5_telem))
         print("[--DEBUG--] transition_examples =", len(transition_examples))
         print("[--DEBUG--] sequence_examples =", len(sequence_examples))
-        
+        cmd_name = self.get_command_name(command_id)
+        # system_text = """
+        # You are a MAVLink telemetry predictor for a drone honeypot.
+
+        # You are given:
+        # - the current command
+        # - the current heartbeat
+        # - the last 5 live telemetry snapshots
+        # - transition examples from past traces
+        # - short future telemetry examples from past traces
+        # - the allowed telemetry schema
+        # - always generate the battery remaining
+
+        # Your task:
+        # - generate the next 5 telemetry states after this command
+        # - use only canonical MAVLink telemetry names
+        # - group telemetry by MAVLink message name
+        # - follow the allowed telemetry schema exactly
+        # - arming only will not mean taking off
+        # - you have to complete target within the 5 steps
+
+        # Return ONLY valid JSON in exactly this format:
+        # {
+        # "telemetry_series": [
+        #     {"dt": 0.0, "fields": {}},
+        #     {"dt": 0.1, "fields": {}},
+        #     {"dt": 0.2, "fields": {}},
+        #     {"dt": 0.3, "fields": {}},
+        #     {"dt": 0.4, "fields": {}}
+        # ],
+        # "reason": "<short>"
+        # }
+
+        # Rules:
+        # - Only use message groups and fields defined in allowed_telemetry_groups.
+        # - do not generate movements while taking off or landing.
+        # - Do not use internal/private variable names.
+        # - Keep changes smooth and realistic.
+        # - If a field is not needed, omit it.
+        # - Always start your first telemetry state from the values in last_5_telemetry.   
+        # - Use examples only to learn what fields change — never copy their absolute values.  
+        # - Return JSON only.
+        # """.strip()
         system_text = """
         You are a MAVLink telemetry predictor for a drone honeypot.
 
         You are given:
         - the current command
         - the current heartbeat
-        - the last 5 live telemetry snapshots
+        - the most recent live telemetry context
         - transition examples from past traces
         - short future telemetry examples from past traces
         - the allowed telemetry schema
-        - always generate the battery remaining
-        - your alt will change for taking off or landing
 
         Your task:
         - generate the next 5 telemetry states after this command
         - use only canonical MAVLink telemetry names
         - group telemetry by MAVLink message name
         - follow the allowed telemetry schema exactly
+        - keep the sequence physically consistent and smooth
+        - preserve continuity from the latest telemetry state
 
         Return ONLY valid JSON in exactly this format:
         {
@@ -1134,14 +1211,46 @@ class LLMHoneypot:
 
         Rules:
         - Only use message groups and fields defined in allowed_telemetry_groups.
-        - Do not use internal/private variable names.
-        - Keep changes smooth and realistic.
-        - If a field is not needed, omit it.
-        - Return JSON only.
+        - Do not use internal or private variable names.
+        - Keep all changes smooth, realistic, and temporally consistent.
+        - The first telemetry state at dt=0.0 must begin from the latest available telemetry state.
+        - Use examples only to learn which fields change and the style of change. Never copy absolute values.
+        - Always include SYS_STATUS.battery_remaining.
+        - If a field does not need to change, keep it unchanged or omit it.
+        - Keep telemetry internally consistent across message groups.
+
+        Command-specific behavior:
+        - ARM/DISARM (400): may change armed-related behavior, but must not simulate takeoff unless a takeoff command is given.
+        - TAKEOFF (22): perform a smooth vertical climb. Horizontal movement should remain minimal. Relative altitude must increase toward the target altitude.
+        - WAYPOINT (16): move smoothly toward target latitude and longitude while maintaining target altitude.
+        - LAND (21): descend smoothly toward ground with minimal horizontal movement.
+        
+        For WAYPOINT (16):
+        - Move in a straight line from current position to the target position.
+        - At every step, reduce the distance to the target.
+        - Do not move sideways or away from the direct path.
+        - If any drift occurs, correct the direction back toward the straight path.
+        - Maintain smooth and consistent velocity toward the target.
+
+        Completion requirement:
+        - The generated 5-step sequence must move the drone toward the command target.
+        - If the target is reachable within 5 steps, fully complete it.
+        - If the target is not realistically reachable within 5 steps, make strong, consistent progress toward it without unrealistic jumps.
+        - Do not overshoot and reverse direction within the same 5 steps.
+
+        Consistency requirements:
+        - GLOBAL_POSITION_INT.relative_alt and VFR_HUD.alt must follow the same trend.
+        - If altitude increases, climb should be positive or zero.
+        - If altitude decreases, climb should be negative or zero.
+        - Do not abruptly change direction unless already indicated by current telemetry.
+        - Keep velocity, altitude, and heading changes smooth and consistent.
+
+        Return JSON only.
         """.strip()
         user_payload = {
             "command": {
                 "id": int(command_id),
+                "name": cmd_name,
                 "params": {
                     "param1": float(params.get("param1", 0.0)),
                     "param2": float(params.get("param2", 0.0)),
@@ -1202,7 +1311,7 @@ class LLMHoneypot:
             base = time.monotonic()
 
             with self.override_lock:
-                self.override_series.clear()
+                self.override_series.clear() # new 2 | commented for telemetry patch
                 for step in translated_series:
                     self.override_series.append({
                         "apply_at": base + float(step["dt"]),
@@ -1298,16 +1407,33 @@ class LLMHoneypot:
         msg_type = msg.get_type()
         attacker_msg = {"type": msg_type}
 
-        # to fix the ack thing /////////
-        # ts = int(getattr(msg, "target_system", 1))
-        # tc = int(getattr(msg, "target_component", 1))
-        # to fix the ack thing /////////
-
-        # ts = msg.get_srcSystem()
-        # tc = msg.get_srcComponent()    
-
         ts = int(getattr(msg, "get_srcSystem", lambda: 255)())
         tc = int(getattr(msg, "get_srcComponent", lambda: 190)())
+
+
+        # the - mission 
+        if msg_type == "MISSION_COUNT":
+            handle_mission_count(self, msg)
+            return
+
+        if msg_type in ("MISSION_ITEM_INT", "MISSION_ITEM"):
+            handle_mission_item(self, msg)
+            if mission_upload_complete(self):
+                finalize_mission_upload(self)
+            return
+
+        if msg_type == "SET_MODE":
+            base_mode = int(getattr(msg, "base_mode", 0))
+            custom_mode = int(getattr(msg, "custom_mode", 0))
+
+            print(f"[SET_MODE RX] base_mode={base_mode} custom_mode={custom_mode}", flush=True)
+
+            with self.state_lock:
+                self.state.base_mode = base_mode
+                self.state.custom_mode = custom_mode
+
+            return
+        # the - mission 
 
 
         # ------------------------------------------------------------
@@ -1362,6 +1488,38 @@ class LLMHoneypot:
         if msg_type == "COMMAND_LONG":
             cmd = int(getattr(msg, "command", -1))
             attacker_msg["command"] = cmd
+
+            print(f"[COMMAND_LONG RX] cmd={cmd}", flush=True)
+
+            
+            # the - mission
+            if cmd == mavutil.mavlink.MAV_CMD_MISSION_START:
+                ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
+                    int(cmd),
+                    int(mavutil.mavlink.MAV_RESULT_ACCEPTED)
+                )
+                print('reached command')
+                self.send_mav(ack_msg)
+                start_mission(self)
+                return
+
+            if cmd == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+                base_mode = int(getattr(msg, "param1", 0))
+                custom_mode = int(getattr(msg, "param2", 0))
+
+                print(f"[DO_SET_MODE RX] base_mode={base_mode} custom_mode={custom_mode}", flush=True)
+
+                with self.state_lock:
+                    self.state.base_mode = base_mode
+                    self.state.custom_mode = custom_mode
+
+                ack = self.mav_out.command_ack_encode(
+                    cmd,
+                    mavutil.mavlink.MAV_RESULT_ACCEPTED
+                )
+                self.send_mav(ack)
+                return
+            # the - mission 
 
             # ---------------------------
             # B1) Telemetry stream request
@@ -1464,37 +1622,25 @@ class LLMHoneypot:
             print(f"[ACK RULE] cmd={cmd} result={result_name} reason={reason}", flush=True) #debug
 
 
-            # ack_msg = self.mav_out.command_ack_encode(cmd, result) #commented for ack handling
-            # self.send_mav(ack_msg) #commented for ack handling
-            # ack_msg = self.mav_out.command_ack_encode(
-            #     cmd, result,
-            #     0,  # progress
-            #     0,  # result_param2
-            #     ts, # target_system
-            #     tc  # target_component
-            # )
-            # ack_msg = self.mav_out.command_ack_encode(cmd, result)
-            # self.send_mav(ack_msg)
-
-            # //// delete below if fails
-            # try:
-            #     # old pymavlink signature (only command, result)
-            #     ack_msg = self.mav_out.command_ack_encode(int(cmd), int(result))
-            # except TypeError:
-            #     # newer message shape with target fields
-            #     ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
-            #         int(cmd), int(result), 0, 0, int(ts), int(tc)
-            #     )
-            # self.send_mav(ack_msg)
-            # //// delete above if fails
-
             ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
                 int(cmd), int(result)
             )
             print(f"[ACK TX] cmd={cmd} result={result}", flush=True)
             self.send_mav(ack_msg)          
 
+            # if ack then prompt else not. #new
+            # ✅ ADD THIS CONDITION
+            if result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                print(f"[LLM SKIPPED] cmd={cmd} because ACK={result}", flush=True)
+                return
+
             #  pending: log the ack as well:
+
+
+            # # new 2 | telemetry patch
+            # self.active_cmd = cmd
+            # self.active_params = params
+            # # new 2 | telemetry patch
 
 
             # log command into history (so LLM sees it next time)
@@ -1563,22 +1709,7 @@ class LLMHoneypot:
         # Other message types (optional: track or ignore)
         # ------------------------------------------------------------
         return
-
-
-
         # ////////////// telemetry /////////////////////
-
-
-
-        # commenting for static heartbeat testing ////////////////////////
-
-                # if self.llm_enabled:
-                #     response = self.llm_prompt(attacker_msg)
-
-                #     if response and self.verify_response(response):
-                #         self.llm_logging(attacker_msg, response)
-                #         self.llm_output_process(response)
-        # commenting for static heartbeat testing ////////////////////////
 
 
 
@@ -1604,6 +1735,12 @@ class LLMHoneypot:
         self.enable_default_telem_streams() # new ///
 
         while True:
+
+            # the - mission
+            maybe_start_uploaded_mission(self)
+            start_or_tick_mission(self)
+            # the - mission
+
             try:
                 data, addr = self.sock.recvfrom(4096)
                 # print("[RX UDP addr]", addr, "len=", len(data), flush=True) ##debug dlt later

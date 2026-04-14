@@ -180,6 +180,31 @@ def make_battery_status(mav, s: CommonState):
         int(s.battery_remaining)   # 👈 reuse existing value
     )
 
+
+# new 2
+def make_home_position(mav, s: CommonState):
+    if not s.home_initialized and s.gpi_lat != 0 and s.gpi_lon != 0:
+        s.home_lat = s.gpi_lat
+        s.home_lon = s.gpi_lon
+        s.home_alt = s.gpi_alt
+        s.home_initialized = True
+
+    return mav.home_position_encode(
+        int(s.home_lat),
+        int(s.home_lon),
+        int(s.home_alt),
+        0, 0, 0,
+        [1, 0, 0, 0],
+        0.0, 0.0, 0.0
+    )
+
+
+# mission helper | current mission # new
+def make_mission_current(mav, s: CommonState):
+    return mav.mission_current_encode(
+        int(s.mission_seq)
+    )
+
 TELEM_BUILDERS = {
     "SYS_STATUS": make_sys_status,
     "GPS_RAW_INT": make_gps_raw_int,
@@ -187,6 +212,8 @@ TELEM_BUILDERS = {
     "ATTITUDE": make_attitude,
     "VFR_HUD": make_vfr_hud,
     "BATTERY_STATUS": make_battery_status, #new
+    "HOME_POSITION": make_home_position, # new 2
+    "MISSION_CURRENT": make_mission_current, # current mission # new
 }
 # ////////// telemetry //////////
 
@@ -849,3 +876,12 @@ def rule_based_ack(cmd, params, state):
 
     return mavutil.mavlink.MAV_RESULT_UNSUPPORTED, "unsupported command"
 #  /////////// command_ack //////////
+
+def init_home_once(state: CommonState):
+    if not state.home_initialized and state.gpi_lat != 0 and state.gpi_lon != 0:
+        state.home_lat = state.gpi_lat
+        state.home_lon = state.gpi_lon
+        state.home_alt = state.gpi_alt
+        state.home_initialized = True
+
+
