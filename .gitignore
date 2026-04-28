@@ -1,3 +1,34 @@
 tests/api_key.txt
 tests/honeypot_2_without_state.py
 tests/honeypot_2.py
+# Python cache
+__pycache__/
+*.pyc
+
+# Local logs and generated outputs
+logs/
+dumps/
+out/
+RAGS/
+prev_codes/
+
+# MAVLink / QGC / telemetry files
+*.tlog
+*.tlog.raw
+*.parm
+
+# JSON/JSONL logs
+*.jsonl
+tests/captured_llm_io.json
+tests/captured_llm_io.jsonl
+tests/cmd_rx_log.jsonl
+tests/llm_io_log.jsonl
+
+# Local test/helper outputs
+tests/LLM_as_listener/
+tests/capture_logs_from_llm_io.py
+tests/extract_logs_accuracy.py
+tests/readme.txt
+
+# Notebook checkpoints
+.ipynb_checkpoints/
