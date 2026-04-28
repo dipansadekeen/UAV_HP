@@ -448,11 +448,18 @@ class LLMHoneypot:
     def enable_default_telem_streams(self):
         now = time.monotonic()
         with self.stream_lock:
-            self.streams["SYS_STATUS"] = [5.0, now]
-            self.streams["GPS_RAW_INT"] = [1.0, now]
-            self.streams["GLOBAL_POSITION_INT"] = [5.0, now]
-            self.streams["ATTITUDE"] = [10.0, now]
-            self.streams["VFR_HUD"] = [5.0, now]
+            # self.streams["SYS_STATUS"] = [5.0, now]
+            # self.streams["GPS_RAW_INT"] = [1.0, now]
+            # self.streams["GLOBAL_POSITION_INT"] = [5.0, now]
+            # self.streams["ATTITUDE"] = [10.0, now]
+            # self.streams["VFR_HUD"] = [5.0, now]
+            # self.streams["BATTERY_STATUS"] = [2.0, now] #new
+            # self.streams["MISSION_CURRENT"] = [2.0, now] # current mission # new
+            self.streams["SYS_STATUS"] = [2.0, now]
+            self.streams["GPS_RAW_INT"] = [2.0, now]
+            self.streams["GLOBAL_POSITION_INT"] = [2.0, now]
+            self.streams["ATTITUDE"] = [2.0, now]
+            self.streams["VFR_HUD"] = [2.0, now]
             self.streams["BATTERY_STATUS"] = [2.0, now] #new
             self.streams["MISSION_CURRENT"] = [2.0, now] # current mission # new
 
@@ -486,14 +493,25 @@ class LLMHoneypot:
     OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
     OLLAMA_TIMEOUT_SEC = 20
 
+    # LLM_OUTPUT_RULES = """
+    # Return ONLY valid JSON in this exact shape:
+    # {
+    # "verdict": {"label": "benign|suspicious|attack", "reason": "short"},
+    # "state_patch": { "<CommonState field>": <value>, ... },
+    # "telemetry_series": [
+    #     {"dt": 0.0, "fields": {"<CommonState field>": <value>, ...}},
+    #     {"dt": 0.1, "fields": {...}},
+    #     ...
+    # ]
+    # }
     LLM_OUTPUT_RULES = """
     Return ONLY valid JSON in this exact shape:
     {
     "verdict": {"label": "benign|suspicious|attack", "reason": "short"},
     "state_patch": { "<CommonState field>": <value>, ... },
     "telemetry_series": [
-        {"dt": 0.0, "fields": {"<CommonState field>": <value>, ...}},
-        {"dt": 0.1, "fields": {...}},
+        {"dt": 0.5, "fields": {"<CommonState field>": <value>, ...}},
+        {"dt": 1.0, "fields": {...}},
         ...
     ]
     }
@@ -767,68 +785,68 @@ class LLMHoneypot:
         except Exception as e:
             print(f"[CMD_LLM_LOG_ERROR] {e}", flush=True)
 
-    def llm_prompt_command(self, command_id: int, params: Dict[str, Any]) -> Optional[dict]:
-        # Snapshot state + history
-        with self.state_lock:
-            snapshot = self.state.__dict__.copy()
-        hist = self.hist.snapshot()
+    # def llm_prompt_command(self, command_id: int, params: Dict[str, Any]) -> Optional[dict]:
+    #     # Snapshot state + history
+    #     with self.state_lock:
+    #         snapshot = self.state.__dict__.copy()
+    #     hist = self.hist.snapshot()
 
-        # fewshot = rag_retrieve_examples(self.command_rag_rows, command_id, k=3)
-        fewshot_trace = rag_retrieve_examples(self.cmd_trace_rows, command_id, k=2) # changed
-        fewshot_seq   = rag_retrieve_examples(self.cmd_seq_rows, command_id, k=2)
+    #     # fewshot = rag_retrieve_examples(self.command_rag_rows, command_id, k=3)
+    #     fewshot_trace = rag_retrieve_examples(self.cmd_trace_rows, command_id, k=2) # changed
+    #     fewshot_seq   = rag_retrieve_examples(self.cmd_seq_rows, command_id, k=2)
 
-        fewshot = {
-            "trace_examples": fewshot_trace,
-            "sequence_examples": fewshot_seq,
-        }
+    #     fewshot = {
+    #         "trace_examples": fewshot_trace,
+    #         "sequence_examples": fewshot_seq,
+    #     }
 
-        system_text = """
-        You are an autopilot behavior generator for a MAVLink honeypot.
-        Return ONLY valid JSON. No prose.
+    #     system_text = """
+    #     You are an autopilot behavior generator for a MAVLink honeypot.
+    #     Return ONLY valid JSON. No prose.
 
-        Output EXACTLY:
-        {
-        "ack": {"command": <int>, "result": "ACCEPTED|DENIED|UNSUPPORTED|TEMPORARILY_REJECTED", "reason": "short"},
-        "heartbeat_patch": {"base_mode": <int optional>, "custom_mode": <int optional>, "system_status": <int optional>},
-        "state_patch": { "<CommonState field>": <value>, ... },
-        "telemetry_series": [
-            {"dt": 0.0, "fields": {...}},
-            ...
-            {"dt": 0.4, "fields": {...}}
-        ]
-        }
+    #     Output EXACTLY:
+    #     {
+    #     "ack": {"command": <int>, "result": "ACCEPTED|DENIED|UNSUPPORTED|TEMPORARILY_REJECTED", "reason": "short"},
+    #     "heartbeat_patch": {"base_mode": <int optional>, "custom_mode": <int optional>, "system_status": <int optional>},
+    #     "state_patch": { "<CommonState field>": <value>, ... },
+    #     "telemetry_series": [
+    #         {"dt": 0.0, "fields": {...}},
+    #         ...
+    #         {"dt": 0.4, "fields": {...}}
+    #     ]
+    #     }
 
-        Rules:
-        - telemetry_series MUST have exactly 5 steps
-        - dt values MUST be: 0.0, 0.1, 0.2, 0.3, 0.4 (no other dt allowed).
-        - Do NOT include dt=0.5 or dt=1.0.
-        - Only use fields that exist in CommonState.
-        - Smooth realistic changes (no big jumps).
-        - heartbeat_patch may ONLY change base_mode, custom_mode, system_status.
-        - base_mode armed flag is bit 7 (0x80); system_status: 3=STANDBY, 4=ACTIVE.
-        """.strip()
+    #     Rules:
+    #     - telemetry_series MUST have exactly 5 steps
+    #     - dt values MUST be: 0.0, 0.1, 0.2, 0.3, 0.4 (no other dt allowed).
+    #     - Do NOT include dt=0.5 or dt=1.0.
+    #     - Only use fields that exist in CommonState.
+    #     - Smooth realistic changes (no big jumps).
+    #     - heartbeat_patch may ONLY change base_mode, custom_mode, system_status.
+    #     - base_mode armed flag is bit 7 (0x80); system_status: 3=STANDBY, 4=ACTIVE.
+    #     """.strip()
 
-        user_text = json.dumps({
-            "command": {"id": int(command_id), "params": params},
-            "current_state": snapshot,
-            "history": hist,
-            "fewshot": fewshot,
-            "instruction": "Generate ACK and the next 1 second of telemetry impact from this command."
-        })
+    #     user_text = json.dumps({
+    #         "command": {"id": int(command_id), "params": params},
+    #         "current_state": snapshot,
+    #         "history": hist,
+    #         "fewshot": fewshot,
+    #         "instruction": "Generate ACK and the next 1 second of telemetry impact from this command."
+    #     })
 
-        try:
-            # raw = self.call_ollama(system_text, user_text)
-            # raw = self.call_ollama(system_text, user_text, tag="command")
-            # parsed = extract_json(raw)
-            # return parsed
-            print("\n[LLM USER PROMPT]")
-            print(user_text)
-            raw = self.call_ollama(system_text, user_text, tag="command")
-            parsed = extract_json(raw)
-            return {"_raw": raw, "_parsed": parsed}
-        except Exception as e:
-            print(f"[LLM CMD ERROR] {e}", flush=True)
-            return None
+    #     try:
+    #         # raw = self.call_ollama(system_text, user_text)
+    #         # raw = self.call_ollama(system_text, user_text, tag="command")
+    #         # parsed = extract_json(raw)
+    #         # return parsed
+    #         print("\n[LLM USER PROMPT]")
+    #         print(user_text)
+    #         raw = self.call_ollama(system_text, user_text, tag="command")
+    #         parsed = extract_json(raw)
+    #         return {"_raw": raw, "_parsed": parsed}
+    #     except Exception as e:
+    #         print(f"[LLM CMD ERROR] {e}", flush=True)
+    #         return None
 
 
     def apply_llm_command_result(self, response: dict) -> None:
@@ -1178,6 +1196,7 @@ class LLMHoneypot:
         # - Use examples only to learn what fields change — never copy their absolute values.  
         # - Return JSON only.
         # """.strip()
+
         system_text = """
         You are a MAVLink telemetry predictor for a drone honeypot.
 
@@ -1200,11 +1219,11 @@ class LLMHoneypot:
         Return ONLY valid JSON in exactly this format:
         {
         "telemetry_series": [
-            {"dt": 0.0, "fields": {}},
-            {"dt": 0.1, "fields": {}},
-            {"dt": 0.2, "fields": {}},
-            {"dt": 0.3, "fields": {}},
-            {"dt": 0.4, "fields": {}}
+            {"dt": 0.5, "fields": {}},
+            {"dt": 1.0, "fields": {}},
+            {"dt": 1.5, "fields": {}},
+            {"dt": 2.0, "fields": {}},
+            {"dt": 2.5, "fields": {}}
         ],
         "reason": "<short>"
         }
@@ -1213,7 +1232,7 @@ class LLMHoneypot:
         - Only use message groups and fields defined in allowed_telemetry_groups.
         - Do not use internal or private variable names.
         - Keep all changes smooth, realistic, and temporally consistent.
-        - The first telemetry state at dt=0.0 must begin from the latest available telemetry state.
+        - The first telemetry state at dt=0.5 must begin from the latest available telemetry state. -
         - Use examples only to learn which fields change and the style of change. Never copy absolute values.
         - Always include SYS_STATUS.battery_remaining.
         - If a field does not need to change, keep it unchanged or omit it.
@@ -1244,6 +1263,15 @@ class LLMHoneypot:
         - If altitude decreases, climb should be negative or zero.
         - Do not abruptly change direction unless already indicated by current telemetry.
         - Keep velocity, altitude, and heading changes smooth and consistent.
+        
+        Speed consistency:
+        - Treat each step as: speed determines how far position should move during that step.
+        - First decide whether the movement should be slow, moderate, or fast.
+        - Then make the position change match that speed level for the step duration.
+        - If speed stays similar across nearby steps, position change should also stay similar.
+        - If speed increases, position change should increase smoothly.
+        - If speed decreases, position change should decrease smoothly.
+
 
         Return JSON only.
         """.strip()
@@ -1268,7 +1296,18 @@ class LLMHoneypot:
             "allowed_telemetry_groups": TELEM_GROUPS,
             "instruction": "Generate the next 5 telemetry states using canonical MAVLink field names grouped by message."
         }
-
+        # keeping backup
+        # Return ONLY valid JSON in exactly this format:
+        # {
+        # "telemetry_series": [
+        #     {"dt": 0.0, "fields": {}},
+        #     {"dt": 0.1, "fields": {}},
+        #     {"dt": 0.2, "fields": {}},
+        #     {"dt": 0.3, "fields": {}},
+        #     {"dt": 0.4, "fields": {}}
+        # ],
+        # "reason": "<short>"
+        # }
         user_text = json.dumps(user_payload)
 
         try:
@@ -1339,7 +1378,9 @@ class LLMHoneypot:
             print("[TELEM VERIFY FAIL] telemetry_series must have 5 steps", flush=True)
             return False
 
-        expected_dts = [0.0, 0.1, 0.2, 0.3, 0.4]
+        # expected_dts = [0.0, 0.1, 0.2, 0.3, 0.4]
+        expected_dts = [0.5, 1.0, 1.5, 2.0, 2.5]
+
 
         for i, step in enumerate(series):
             if not isinstance(step, dict):
@@ -1401,7 +1442,7 @@ class LLMHoneypot:
 
         update: Full patched handler:
         - Stream control (SET_MESSAGE_INTERVAL / MAV_CMD_SET_MESSAGE_INTERVAL): handled locally, ACKed, NOT sent to LLM
-        - Other COMMAND_LONG: logged -> LLM (llm_prompt_command) -> apply_llm_command_result (ACK + patches + schedule series)
+        #- Other COMMAND_LONG: logged -> LLM (llm_prompt_command) -> apply_llm_command_result (ACK + patches + schedule series)
         - Everything else: ignore (or extend later)
             """
         msg_type = msg.get_type()

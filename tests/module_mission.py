@@ -119,9 +119,6 @@ def start_mission(hp):
     hp.mission_state["stable_hits"] = 0
     print("[MISSION] started", flush=True)
 
-
-
-
 def get_current_mission_item(hp):
     seq = hp.mission_state["current_seq"]
     return hp.mission_state["items"].get(seq)
