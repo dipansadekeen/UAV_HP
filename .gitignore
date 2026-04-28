@@ -32,3 +32,4 @@ tests/readme.txt
 
 # Notebook checkpoints
 .ipynb_checkpoints/
+how_many_commands_covered.py
