@@ -27,6 +27,8 @@ from module_helper_functions import (
 )
 from module_mission import *
 
+from module_log import log_mission_llm_csv
+
 class LLMHoneypot:
 
     # ---------------------------
@@ -111,6 +113,11 @@ class LLMHoneypot:
 
         # the - mission
         init_mission_state(self)
+
+        # mission logging
+        self.mission_run_id = time.strftime("mission_%Y%m%d_%H%M%S")
+        self.mission_name = "qgc_uploaded_mission"
+
 
     # to translate the commands # example: name : MAV_CMD_COMPONENT_ARM_DISARM -- giving enums to the model
     def get_command_name(self, command_id: int) -> str:
@@ -536,7 +543,7 @@ class LLMHoneypot:
                 api_key = f.read().strip()
 
             payload = {
-                "model": "gpt-oss:20b-cloud",
+                "model": "gpt-oss:120b-cloud",
                 "messages": [
                     {"role": "system", "content": system_text},
                     {"role": "user", "content": user_text}
@@ -1232,7 +1239,7 @@ class LLMHoneypot:
         - Only use message groups and fields defined in allowed_telemetry_groups.
         - Do not use internal or private variable names.
         - Keep all changes smooth, realistic, and temporally consistent.
-        - The first telemetry state at dt=0.5 must begin from the latest available telemetry state. -
+        - The first telemetry state at dt=0.5 must begin from the latest available telemetry state.
         - Use examples only to learn which fields change and the style of change. Never copy absolute values.
         - Always include SYS_STATUS.battery_remaining.
         - If a field does not need to change, keep it unchanged or omit it.
@@ -1264,14 +1271,19 @@ class LLMHoneypot:
         - Do not abruptly change direction unless already indicated by current telemetry.
         - Keep velocity, altitude, and heading changes smooth and consistent.
         
-        Speed consistency:
-        - Treat each step as: speed determines how far position should move during that step.
-        - First decide whether the movement should be slow, moderate, or fast.
-        - Then make the position change match that speed level for the step duration.
-        - If speed stays similar across nearby steps, position change should also stay similar.
-        - If speed increases, position change should increase smoothly.
-        - If speed decreases, position change should decrease smoothly.
-
+        Kinematic realism:
+        - First update position: GLOBAL_POSITION_INT.lat/lon/relative_alt and VFR_HUD.alt.
+        - VFR_HUD.alt is meters; GLOBAL_POSITION_INT.relative_alt is millimeters, so relative_alt = VFR_HUD.alt × 1000.
+        - For normal waypoint flight, choose groundspeed around 8–10.
+        - For takeoff/landing, keep horizontal groundspeed low, around 0 m/s.
+        - If groundspeed is 0, lat/lon must not change.
+        - If the waypoint is closer than the allowed movement, slow down and stop at the target.
+        - vx/vy/vz must describe the same movement shown by lat/lon/altitude. Use cm/s integers.
+        - VFR_HUD.heading must point in the same direction as lat/lon movement.
+        - GLOBAL_POSITION_INT.hdg = VFR_HUD.heading × 100.
+        - ATTITUDE.yaw must match heading in radians.
+        - Pitch should be near 0, slightly positive during climb, and slightly negative during descent.
+        - Roll should be near 0 unless the drone is turning.
 
         Return JSON only.
         """.strip()
@@ -1296,18 +1308,7 @@ class LLMHoneypot:
             "allowed_telemetry_groups": TELEM_GROUPS,
             "instruction": "Generate the next 5 telemetry states using canonical MAVLink field names grouped by message."
         }
-        # keeping backup
-        # Return ONLY valid JSON in exactly this format:
-        # {
-        # "telemetry_series": [
-        #     {"dt": 0.0, "fields": {}},
-        #     {"dt": 0.1, "fields": {}},
-        #     {"dt": 0.2, "fields": {}},
-        #     {"dt": 0.3, "fields": {}},
-        #     {"dt": 0.4, "fields": {}}
-        # ],
-        # "reason": "<short>"
-        # }
+
         user_text = json.dumps(user_payload)
 
         try:
@@ -1339,6 +1340,15 @@ class LLMHoneypot:
             #             "apply_at": base + float(step["dt"]),
             #             "fields": step["fields"],
             #         })
+
+            log_mission_llm_csv(
+                hp=self,
+                command_id=command_id,
+                command_name=cmd_name,
+                params=params,
+                user_payload=user_payload,
+                parsed=parsed,
+            )
 
             series = parsed.get("telemetry_series", [])
             translated_series = translate_canonical_series_to_internal(series)

@@ -1,0 +1,64 @@
+        # keeping backup
+        # Return ONLY valid JSON in exactly this format:
+        # {
+        # "telemetry_series": [
+        #     {"dt": 0.0, "fields": {}},
+        #     {"dt": 0.1, "fields": {}},
+        #     {"dt": 0.2, "fields": {}},
+        #     {"dt": 0.3, "fields": {}},
+        #     {"dt": 0.4, "fields": {}}
+        # ],
+        # "reason": "<short>"
+        # }
+
+
+
+
+        # Speed consistency: v1
+        # - Treat each step as: speed determines how far position should move during that step.
+        # - First decide whether the movement should be slow, moderate, or fast.
+        # - Then make the position change match that speed level for the step duration.
+        # - If speed stays similar across nearby steps, position change should also stay similar.
+        # - If speed increases, position change should increase smoothly.
+        # - If speed decreases, position change should decrease smoothly.
+
+        # Kinematic realism: v2
+        # - First update GLOBAL_POSITION_INT.lat/lon/relative_alt and VFR_HUD.alt, then derive motion/orientation fields from those updated positions.
+        # - Enforce unit consistency: VFR_HUD.alt is meters, GLOBAL_POSITION_INT.relative_alt is millimeters, and relative_alt = VFR_HUD.alt × 1000.
+        # - Never scale decimal altitude incorrectly; for example, 50.35 m must not become 503.5 m.
+        # - For each 0.5 s interval, limit horizontal displacement to the distance allowed by VFR_HUD.groundspeed.
+        # - Compute GLOBAL_POSITION_INT.vx/vy/vz from the change in position and altitude over the 0.5 s interval, using cm/s integers.
+        # - Compute VFR_HUD.heading from the actual lat/lon movement direction, then set GLOBAL_POSITION_INT.hdg = heading × 100.
+        # - Compute ATTITUDE.yaw from heading in radians and keep it normalized to [-pi, pi].
+        # - Use pitch only to reflect climb/descent behavior and roll only to reflect turning behavior.
+        # - Do not independently invent velocity, heading, yaw, pitch, or roll values.
+
+
+
+
+        Kinematic realism:
+        - First update position: GLOBAL_POSITION_INT.lat/lon/relative_alt and VFR_HUD.alt.
+        - VFR_HUD.alt is meters; GLOBAL_POSITION_INT.relative_alt is millimeters, so relative_alt = VFR_HUD.alt × 1000.
+        - For normal waypoint flight, choose groundspeed around 8–10.
+        - For takeoff/landing, keep horizontal groundspeed low, around 0 m/s.
+        - If groundspeed is 0, lat/lon must not change.
+        - If the waypoint is closer than the allowed movement, slow down and stop at the target.
+        - vx/vy/vz must describe the same movement shown by lat/lon/altitude. Use cm/s integers.
+        - VFR_HUD.heading must point in the same direction as lat/lon movement.
+        - GLOBAL_POSITION_INT.hdg = VFR_HUD.heading × 100.
+        - ATTITUDE.yaw must match heading in radians: 90° ≈ 1.57, 180° ≈ 3.14, 270° ≈ -1.57.
+        - Pitch should be near 0, slightly positive during climb, and slightly negative during descent.
+        - Roll should be near 0 unless the drone is turning.
+        - Do not independently invent velocity, heading, yaw, pitch, or roll values.
+
+
+
+--garbage -- only maintained straight line
+Kinematic realism:
+- For WAYPOINT commands, straight-line movement toward the target has highest priority.
+- First generate lat/lon points along the direct line from the latest position to the target.
+- Each step must reduce distance to the target and must not drift sideways, overshoot, or reverse.
+- After lat/lon/altitude are chosen, derive groundspeed, vx/vy/vz, heading, hdg, yaw, pitch, and roll from that motion.
+- Velocity, heading, hdg, and yaw must align with the straight-line movement.
+- Keep altitude, climb, and relative_alt consistent.
+- For TAKEOFF/LAND, prioritize vertical movement with minimal horizontal movement.
