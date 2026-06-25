@@ -1,0 +1,3 @@
+file,compared_duration_min,heartbeat_count,median_interval_sec,mean_interval_sec,std_interval_sec,max_interval_sec,dropouts_over_1.5_sec,dropouts_over_2.0_sec
+2026-05-22 17-53-14.tlog,43.89,5238,0.504,0.503,0.295,1.792,1,0
+2026-05-23 16-47-29.tlog,43.89,3384,0.967,0.778,0.318,1.348,0,0

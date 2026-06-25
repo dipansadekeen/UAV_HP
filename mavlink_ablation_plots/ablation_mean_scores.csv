@@ -1,0 +1,4 @@
+ablation_setting,line_following_score,velocity_displacement_score,vx_vy_score,vz_altitude_score,altitude_score,heading_yaw_score,roll_pitch_score,overall_realism_score
+Without Transition,6.829,3.911,2.977,8.36,9.197,5.82,9.139,5.548
+Without Sequence,7.256,3.53,1.978,8.497,8.822,6.292,8.884,5.576
+With Both,5.975,4.434,2.736,8.863,9.178,5.528,8.932,5.463

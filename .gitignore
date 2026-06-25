@@ -1,6 +1,7 @@
 tests/api_key.txt
 tests/honeypot_2_without_state.py
 tests/honeypot_2.py
+tests/gemini_api.txt
 # Python cache
 __pycache__/
 *.pyc

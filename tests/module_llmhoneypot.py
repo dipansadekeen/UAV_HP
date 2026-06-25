@@ -26,9 +26,9 @@ from module_helper_functions import (
     rule_based_ack,
 )
 from module_mission import *
-
 from module_log import log_mission_llm_csv
-
+from module_rag import attach_rag_to_hp, retrieve_best_examples_split_from_hp
+from module_cloud_models import call_gemini_cloud
 class LLMHoneypot:
 
     # ---------------------------
@@ -119,6 +119,9 @@ class LLMHoneypot:
         self.mission_name = "qgc_uploaded_mission"
 
 
+        # --- new telemetry-state-aware RAG rows --- || RAG
+        attach_rag_to_hp(self,transition_path="../out/cmd_transition.jsonl",sequence_path="../out/px4_command_sequences.jsonl")
+
     # to translate the commands # example: name : MAV_CMD_COMPONENT_ARM_DISARM -- giving enums to the model
     def get_command_name(self, command_id: int) -> str:
         """
@@ -142,7 +145,7 @@ class LLMHoneypot:
             "system_text": system_text,    # optional (can be huge)
             "user_text": user_text,        # optional (can be huge)
             "raw": raw,
-            "parsed": parsed,
+            # "parsed": parsed,
         }
         try:
             with open("llm_io_log.jsonl", "a") as f:
@@ -537,13 +540,13 @@ class LLMHoneypot:
     # new ///
     def call_ollama_cloud(self, system_text: str, user_text: str, tag: str = "general") -> str:
         t0 = time.monotonic()
-
+        model_name = "gpt-oss:20b-cloud" # new
         try:
             with open("api_key.txt", "r") as f:
                 api_key = f.read().strip()
 
             payload = {
-                "model": "gpt-oss:120b-cloud",
+                "model": model_name,  #new
                 "messages": [
                     {"role": "system", "content": system_text},
                     {"role": "user", "content": user_text}
@@ -573,6 +576,9 @@ class LLMHoneypot:
 
             raw = r.json()["message"]["content"]
             dt_ms = (time.monotonic() - t0) * 1000.0
+
+            self.last_llm_latency_ms = dt_ms # new
+            self.last_llm_model_name = model_name #new
 
             parsed = extract_json(raw)
             self.log_llm_io(tag, system_text, user_text, raw, parsed, dt_ms)
@@ -608,6 +614,9 @@ class LLMHoneypot:
         
         raw = r.json()["message"]["content"]
         dt_ms = (time.monotonic() - t0) * 1000.0
+
+        self.last_llm_latency_ms = dt_ms # new
+        self.last_llm_model_name = self.OLLAMA_MODEL # new
 
         parsed = extract_json(raw)  # may be None
         self.log_llm_io(tag, system_text, user_text, raw, parsed, dt_ms)
@@ -1157,6 +1166,19 @@ class LLMHoneypot:
         sequence_examples = retrieve_telemetry_examples_from_sequences(
             self.cmd_seq_rows, command_id, k=2
         )
+
+        # #  || RAG
+        # rag_pack = retrieve_best_examples_split_from_hp(
+        #     self,
+        #     command_id=command_id,
+        #     params=params,
+        #     k_each=1,
+        # )
+
+        # transition_examples = rag_pack["transition_examples"]
+        # sequence_examples = rag_pack["sequence_examples"]
+        # #  || RAG
+
         print("[--DEBUG--] last_5_telemetry_count =", len(last_5_telem))
         print("[--DEBUG--] transition_examples =", len(transition_examples))
         print("[--DEBUG--] sequence_examples =", len(sequence_examples))
@@ -1250,6 +1272,7 @@ class LLMHoneypot:
         - TAKEOFF (22): perform a smooth vertical climb. Horizontal movement should remain minimal. Relative altitude must increase toward the target altitude.
         - WAYPOINT (16): move smoothly toward target latitude and longitude while maintaining target altitude.
         - LAND (21): descend smoothly toward ground with minimal horizontal movement.
+        - Return to Launch (20): like WAYPOINT you have to reach to coordinates.
         
         For WAYPOINT (16):
         - Move in a straight line from current position to the target position.
@@ -1317,6 +1340,7 @@ class LLMHoneypot:
 
             # raw = self.call_ollama(system_text, user_text, tag="telemetry_command")
             raw = self.call_ollama_cloud(system_text, user_text, tag="telemetry_command")
+            # raw = call_gemini_cloud(system_text, user_text, tag="telemetry_command")
             parsed = extract_json(raw)
 
             print("\n[TELEM LLM RAW RESPONSE]")
@@ -1696,8 +1720,6 @@ class LLMHoneypot:
 
             # log command into history (so LLM sees it next time)
             self.hist.add_cmd(cmd, params)
-
-
 
 
             # minimal runtime log (easy to see in terminal)

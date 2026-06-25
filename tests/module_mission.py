@@ -1,12 +1,17 @@
 # mission.py
 import time
 from pymavlink import mavutil
-
+import math
 
 MISSION_CMD_WAYPOINT = 16
 MISSION_CMD_TAKEOFF = 22
 MISSION_CMD_LAND = 21
+MISSION_CMD_RTL = 20
+MISSION_CMD_CHANGE_SPEED = 178
 
+def _current_speed_mps(hp):
+    with hp.state_lock:
+        return float(getattr(hp.state, "vfr_groundspeed", 0.0))
 
 def send_mission_request_int(hp, seq):
     msg = hp.mav_out.mission_request_int_encode(
@@ -31,6 +36,12 @@ def init_mission_state(hp):
         "alt_threshold_mm": 1500,
         "reprompt_skip_counter": 0, # new
         "reprompt_skip_limit": 3, # new
+
+
+        "home": None,       # add RTL.
+        "rtl_alt_mm": None, # add RTL.
+
+        "speed_threshold_mps": 0.3,
     }
 
 def handle_mission_count(hp, msg):
@@ -101,7 +112,7 @@ def finalize_mission_upload(hp):
 #     hp.mission_state["current_seq"] = 0
 #     hp.mission_state["stable_hits"] = 0
 #     print("[MISSION] started", flush=True)
-def start_mission(hp):
+def start_mission(hp): # full new RTL version
     if not hp.mission_state["ready"]:
         print("[MISSION] start requested but not ready", flush=True)
         return
@@ -117,6 +128,12 @@ def start_mission(hp):
     hp.mission_state["complete"] = False
     hp.mission_state["current_seq"] = 0
     hp.mission_state["stable_hits"] = 0
+
+    hp.mission_state["home"] = {
+        "lat": int(getattr(hp.state, "gpi_lat", 0)),
+        "lon": int(getattr(hp.state, "gpi_lon", 0)),
+    }
+    hp.mission_state["rtl_alt_mm"] = None
     print("[MISSION] started", flush=True)
 
 def get_current_mission_item(hp):
@@ -124,12 +141,36 @@ def get_current_mission_item(hp):
     return hp.mission_state["items"].get(seq)
 
 
-def _target_from_item(item):
+# def _target_from_item(item):
+#     return {
+#         "lat": int(item.get("x", 0)),
+#         "lon": int(item.get("y", 0)),
+#         "alt_mm": int(float(item.get("z", 0.0)) * 1000.0),
+#     }
+
+# ///////////////RTL
+def _target_from_item(hp, item):
+    cmd = int(item.get("command", -1))
+
+    # old
+    # if cmd == MISSION_CMD_RTL and hp.mission_state.get("start_location"):
+    #     return hp.mission_state["start_location"]
+    #new
+    if cmd == MISSION_CMD_RTL and hp.mission_state.get("home"):
+        home = hp.mission_state["home"]
+        return {
+            "lat": int(home["lat"]),
+            "lon": int(home["lon"]),
+            "alt_mm": int(hp.mission_state.get("rtl_alt_mm") or 0),
+        }
+
     return {
         "lat": int(item.get("x", 0)),
         "lon": int(item.get("y", 0)),
-        "alt_mm": int(float(item.get("z", 0.0)) * 1000.0),
+        # "alt_mm": int(float(item.get("z", 0.0)) * 1000.0),
+        "alt_mm": int((0.0 if math.isnan(float(item.get("z", 0.0))) else float(item.get("z", 0.0))) * 1000.0),
     }
+# ///////////////RTL
 
 
 # def execute_current_item_with_llm(hp, item):
@@ -171,16 +212,46 @@ def execute_current_item_with_llm(hp, item):
         )
         return
 
+
     cmd = int(item["command"])
+
+    # ////// commented for RTL ///////
+    # params = {
+    #     "param1": float(item.get("param1", 0.0)),
+    #     "param2": float(item.get("param2", 0.0)),
+    #     "param3": float(item.get("param3", 0.0)),
+    #     "param4": float(item.get("param4", 0.0)),
+    #     "param5": float(item.get("x", 0)),
+    #     "param6": float(item.get("y", 0)),
+    #     "param7": float(item.get("z", 0.0)),
+    # }
+    # ////// commented for RTL ///////
+
+    # ////// RTL ///////
+    x = float(item.get("x", 0))
+    y = float(item.get("y", 0))
+    z = float(item.get("z", 0.0))
+
+    if cmd == MISSION_CMD_RTL and hp.mission_state.get("home"):
+        if hp.mission_state["rtl_alt_mm"] is None:
+            with hp.state_lock:
+                hp.mission_state["rtl_alt_mm"] = int(getattr(hp.state, "gpi_relative_alt", 0))
+
+        home = hp.mission_state["home"]
+        x = float(home["lat"])
+        y = float(home["lon"])
+        z = hp.mission_state["rtl_alt_mm"] / 1000.0
+
     params = {
         "param1": float(item.get("param1", 0.0)),
         "param2": float(item.get("param2", 0.0)),
         "param3": float(item.get("param3", 0.0)),
         "param4": float(item.get("param4", 0.0)),
-        "param5": float(item.get("x", 0)),
-        "param6": float(item.get("y", 0)),
-        "param7": float(item.get("z", 0.0)),
+        "param5": x,
+        "param6": y,
+        "param7": z,
     }
+    # ////// RTL ///////
 
     hp.active_cmd = cmd
     hp.active_params = params
@@ -193,7 +264,8 @@ def execute_current_item_with_llm(hp, item):
 
 
 def is_step_complete(hp, item):
-    target = _target_from_item(item)
+    # target = _target_from_item(item)
+    target = _target_from_item(hp, item) # for RTL
 
     with hp.state_lock:
         curr_lat = int(getattr(hp.state, "gpi_lat", 0))
@@ -212,6 +284,20 @@ def is_step_complete(hp, item):
         ok = alt_ok
     elif cmd == MISSION_CMD_LAND:
         ok = curr_alt <= 500
+
+    # ////// for RTL ///////
+    elif cmd == MISSION_CMD_RTL: # RTL
+        ok = lat_ok and lon_ok
+    # ////// for RTL ///////
+
+    # ////// for new speed ///////
+
+    elif cmd == MISSION_CMD_CHANGE_SPEED:
+        target_speed = float(item.get("param2", 0.0))  # speed in m/s
+        curr_speed = _current_speed_mps(hp)
+        ok = abs(curr_speed - target_speed) <= hp.mission_state.get("speed_threshold_mps", 0.3)
+    # ////// for new speed ///////
+
     else:
         ok = lat_ok and lon_ok and alt_ok
 

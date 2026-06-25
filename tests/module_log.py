@@ -14,7 +14,7 @@ def log_mission_llm_csv(hp, command_id, command_name, params, user_payload, pars
 
     os.makedirs("./logs", exist_ok=True)
 
-    csv_path = "./logs/mission_llm_generation.csv"
+    csv_path = "./logs/mission_llm_generation_v2.csv" # v2 updated as we are adding new column
     file_exists = os.path.exists(csv_path)
 
     llm_call_id = str(uuid.uuid4())
@@ -86,6 +86,8 @@ def log_mission_llm_csv(hp, command_id, command_name, params, user_payload, pars
         "llm_call_id",
         "llm_step_index",
         "dt",
+        "llm_latency_ms", # new
+        "llm_model_name", # new
 
         "input_gpi_lat",
         "input_gpi_lon",
@@ -191,6 +193,8 @@ def log_mission_llm_csv(hp, command_id, command_name, params, user_payload, pars
                 "llm_call_id": llm_call_id,
                 "llm_step_index": i,
                 "dt": step.get("dt"),
+                "llm_latency_ms": getattr(hp, "last_llm_latency_ms", None), # new
+                "llm_model_name": getattr(hp, "last_llm_model_name", None), # new
 
                 **input_state,
 
