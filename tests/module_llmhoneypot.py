@@ -1339,9 +1339,26 @@ class LLMHoneypot:
             print(user_text, flush=True) # view LLM prompt
 
             # raw = self.call_ollama(system_text, user_text, tag="telemetry_command")
+
             raw = self.call_ollama_cloud(system_text, user_text, tag="telemetry_command")
-            # raw = call_gemini_cloud(system_text, user_text, tag="telemetry_command")
-            parsed = extract_json(raw)
+
+
+            # # comment use when gemini #
+            # gemini_result = call_gemini_cloud(system_text, user_text, tag="telemetry_command", model_name="gemini-2.5-flash",log_fn=self.log_llm_io, return_meta=True,)
+            # raw = gemini_result["raw"]
+
+            # self.last_llm_latency_ms = gemini_result["latency_ms"]
+            # self.last_llm_model_name = gemini_result["model_name"]
+
+            # parsed = gemini_result["parsed"]
+
+            # parsed = gemini_result.get("parsed")
+
+            # if parsed is None:
+            #     parsed = extract_json(raw)
+            # # comment use when gemini #
+
+            parsed = extract_json(raw)  # if gemini comment this.
 
             print("\n[TELEM LLM RAW RESPONSE]")
             print(raw, flush=True)
