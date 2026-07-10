@@ -226,6 +226,12 @@ class CommonState:
     home_lon: int = 0
     home_alt: int = 0
 
+    # ------------------------
+    # EXTENDED_SYS_STATE # new jul
+    # ------------------------
+    vtol_state: int = 0       # MAV_VTOL_STATE_UNDEFINED
+    landed_state: int = 1     # MAV_LANDED_STATE_ON_GROUND
+
 
 # /////////// commands /////////////
 

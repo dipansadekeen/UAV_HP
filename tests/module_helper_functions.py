@@ -166,6 +166,13 @@ def make_vfr_hud(mav, s: CommonState):
         float(s.vfr_climb),
     )
 
+# new jul
+def make_extended_sys_state(mav, s: CommonState):
+    return mav.extended_sys_state_encode(
+        int(getattr(s, "vtol_state", 0)),
+        int(getattr(s, "landed_state", 1)),
+    )
+
 # new
 def make_battery_status(mav, s: CommonState):
     return mav.battery_status_encode(
@@ -214,6 +221,9 @@ TELEM_BUILDERS = {
     "BATTERY_STATUS": make_battery_status, #new
     "HOME_POSITION": make_home_position, # new 2
     "MISSION_CURRENT": make_mission_current, # current mission # new
+
+    # QGC uses this to decide flying/landing UI state  | new jul
+    "EXTENDED_SYS_STATE": make_extended_sys_state,
 }
 # ////////// telemetry //////////
 
@@ -873,6 +883,22 @@ def rule_based_ack(cmd, params, state):
             return mavutil.mavlink.MAV_RESULT_ACCEPTED, "waypoint accepted"
         else:
             return mavutil.mavlink.MAV_RESULT_DENIED, "not armed"
+        
+    # DO_REPOSITION / QGC Go To Location # new jul
+    if cmd == getattr(mavutil.mavlink, "MAV_CMD_DO_REPOSITION", 192):
+        if armed and alt > 0.5:
+            return mavutil.mavlink.MAV_RESULT_ACCEPTED, "reposition accepted"
+        else:
+            return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "not flying"
+
+    # RTL (20) #new jul
+    if cmd == mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH:
+        if armed and alt > 0.5:
+            return mavutil.mavlink.MAV_RESULT_ACCEPTED, "rtl accepted"
+        else:
+            return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "not flying"
+        
+    
 
     return mavutil.mavlink.MAV_RESULT_UNSUPPORTED, "unsupported command"
 #  /////////// command_ack //////////

@@ -256,6 +256,10 @@ def execute_current_item_with_llm(hp, item):
     hp.active_cmd = cmd
     hp.active_params = params
     # hp.handle_command_heartbeat(cmd, params)
+
+    # keep QGC flying/landing state consistent during uploaded missions # new jul
+    hp.apply_qgc_flight_state_from_cmd(cmd, params)
+
     hp.handle_command_telemetry(cmd, params)
 
     # after prompting once, begin skip cycle

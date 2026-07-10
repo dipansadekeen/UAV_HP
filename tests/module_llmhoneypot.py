@@ -473,6 +473,9 @@ class LLMHoneypot:
             self.streams["BATTERY_STATUS"] = [2.0, now] #new
             self.streams["MISSION_CURRENT"] = [2.0, now] # current mission # new
 
+            # QGC flying/landing state
+            self.streams["EXTENDED_SYS_STATE"] = [1.0, now] # new jul
+
         print("[DEFAULT STREAMS ENABLED]", list(self.streams.keys()), flush=True)
 
 
@@ -623,6 +626,109 @@ class LLMHoneypot:
 
         return raw
 
+    def apply_qgc_flight_state_from_cmd(self, cmd: int, params: dict): # new jul
+        """
+        Rule-based QGC state update.
+        EXTENDED_SYS_STATE is transmitted continuously by telemetry_loop.
+        This function only changes the current state value.
+        """
+
+        ARM_DISARM = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+        TAKEOFF = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+        LAND = mavutil.mavlink.MAV_CMD_NAV_LAND
+        WAYPOINT = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+        RTL = mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH
+        REPOSITION = getattr(mavutil.mavlink, "MAV_CMD_DO_REPOSITION", 192)
+
+        if cmd == ARM_DISARM:
+            arm = int(round(float(params.get("param1", 0.0)))) == 1
+
+            with self.state_lock:
+                if arm:
+                    self.state.base_mode |= mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                    self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+                    self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
+                else:
+                    self.state.base_mode &= ~mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                    self.state.system_status = mavutil.mavlink.MAV_STATE_STANDBY
+                    self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
+                    self.state.gpi_relative_alt = 0
+                    self.state.vfr_alt = 0.0
+                    self.state.vfr_climb = 0.0
+
+            print(f"[QGC STATE] ARM={arm} landed_state={self.state.landed_state}", flush=True)
+            return
+
+        if cmd == TAKEOFF:
+            target_alt_m = float(params.get("param7", 10.0))
+            if target_alt_m <= 0:
+                target_alt_m = 10.0
+
+            with self.state_lock:
+                self.state.base_mode |= mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+                self.state.vtol_state = mavutil.mavlink.MAV_VTOL_STATE_UNDEFINED
+                self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_TAKEOFF
+
+                if getattr(self.state, "gpi_relative_alt", 0) <= 0:
+                    self.state.gpi_relative_alt = 1000
+                if getattr(self.state, "vfr_alt", 0.0) <= 0:
+                    self.state.vfr_alt = 1.0
+                if getattr(self.state, "vfr_climb", 0.0) <= 0:
+                    self.state.vfr_climb = 1.0
+
+            print("[QGC STATE] EXTENDED_SYS_STATE=TAKEOFF", flush=True)
+
+            def mark_in_air():
+                with self.state_lock:
+                    self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
+                    self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+
+                    if getattr(self.state, "gpi_relative_alt", 0) <= 0:
+                        self.state.gpi_relative_alt = int(target_alt_m * 1000)
+                    if getattr(self.state, "vfr_alt", 0.0) <= 0:
+                        self.state.vfr_alt = float(target_alt_m)
+                    self.state.vfr_climb = 0.0
+
+                print("[QGC STATE] EXTENDED_SYS_STATE=IN_AIR", flush=True)
+
+            threading.Timer(3.0, mark_in_air).start()
+            return
+
+        if cmd == LAND:
+            with self.state_lock:
+                self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_LANDING
+                self.state.vtol_state = mavutil.mavlink.MAV_VTOL_STATE_UNDEFINED
+                self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+                self.state.vfr_climb = -1.0
+
+            print("[QGC STATE] EXTENDED_SYS_STATE=LANDING", flush=True)
+
+            def mark_on_ground():
+                with self.state_lock:
+                    self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
+                    self.state.gpi_relative_alt = 0
+                    self.state.vfr_alt = 0.0
+                    self.state.vfr_climb = 0.0
+                    self.state.vfr_groundspeed = 0.0
+
+                print("[QGC STATE] EXTENDED_SYS_STATE=ON_GROUND", flush=True)
+
+            threading.Timer(3.0, mark_on_ground).start()
+            return
+
+        if cmd in {WAYPOINT, REPOSITION, RTL}:
+            with self.state_lock:
+                self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
+                self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+
+                if getattr(self.state, "gpi_relative_alt", 0) <= 0:
+                    self.state.gpi_relative_alt = 10000
+                if getattr(self.state, "vfr_alt", 0.0) <= 0:
+                    self.state.vfr_alt = 10.0
+
+            print("[QGC STATE] EXTENDED_SYS_STATE=IN_AIR for guided/mission command", flush=True)
+            return
 
     # def llm_prompt(self, attacker_msg: Optional[dict] = None) -> Optional[dict]:
     def llm_prompt(self, attacker_msg=None, context_type="general"):
@@ -1725,6 +1831,9 @@ class LLMHoneypot:
             if result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
                 print(f"[LLM SKIPPED] cmd={cmd} because ACK={result}", flush=True)
                 return
+    
+            # QGC-critical state update # new jul
+            self.apply_qgc_flight_state_from_cmd(cmd, params)
 
             #  pending: log the ack as well:
 
