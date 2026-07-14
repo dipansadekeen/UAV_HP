@@ -2,7 +2,7 @@ import socket
 import time
 import threading
 import json
-import os
+import os, math
 import requests
 from collections import deque
 from typing import Dict, Any, Optional
@@ -121,6 +121,8 @@ class LLMHoneypot:
 
         # --- new telemetry-state-aware RAG rows --- || RAG
         attach_rag_to_hp(self,transition_path="../out/cmd_transition.jsonl",sequence_path="../out/px4_command_sequences.jsonl")
+
+        self.direct_cmd = self.direct_params = None #continous telem | jul 2026
 
     # to translate the commands # example: name : MAV_CMD_COMPONENT_ARM_DISARM -- giving enums to the model
     def get_command_name(self, command_id: int) -> str:
@@ -502,7 +504,7 @@ class LLMHoneypot:
     # core()  (Main loop)
     # ---------------------------
 
-    OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://192.168.1.22:11434")
+    OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://192.168.1.100:11434")
     OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
     OLLAMA_TIMEOUT_SEC = 20
 
@@ -1120,8 +1122,8 @@ class LLMHoneypot:
             print("\n[HB LLM USER PROMPT]")
             print(user_text, flush=True) # view llm prompt
 
-            raw = self.call_ollama(system_text, user_text, tag="heartbeat_command")
-            # raw = self.call_ollama_cloud(system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
+            # raw = self.call_ollama(system_text, user_text, tag="heartbeat_command") #original
+            raw = self.call_ollama_cloud(system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
             parsed = extract_json(raw)
 
             print("\n[HB LLM RAW RESPONSE]")
@@ -1683,13 +1685,37 @@ class LLMHoneypot:
         # ------------------------------------------------------------
         # (B) COMMAND_LONG: may include MAV_CMD_SET_MESSAGE_INTERVAL
         # ------------------------------------------------------------
-        if msg_type == "COMMAND_LONG":
+        # /////////older
+        # if msg_type == "COMMAND_LONG":
+        #     cmd = int(getattr(msg, "command", -1))
+        #     attacker_msg["command"] = cmd
+
+        #     print(f"[COMMAND_LONG RX] cmd={cmd}", flush=True)
+        # /////////older -- before had only command long
+
+
+        # ///////new handled long and int
+        if msg_type in ("COMMAND_LONG", "COMMAND_INT"):
             cmd = int(getattr(msg, "command", -1))
+            is_int = msg_type == "COMMAND_INT"
+
+            params = {
+                **{f"param{i}": float(getattr(msg, f"param{i}", 0)) for i in range(1, 5)},
+                "param5": int(getattr(msg, "x", 0)) if is_int else float(getattr(msg, "param5", 0)),
+                "param6": int(getattr(msg, "y", 0)) if is_int else float(getattr(msg, "param6", 0)),
+                "param7": float(getattr(msg, "z", 0)) if is_int else float(getattr(msg, "param7", 0)),
+            }
+
+            # Normalize COMMAND_LONG coordinates to the same ×1e7 format as COMMAND_INT.
+            if not is_int and cmd in {16, 21, 22, 192}:
+                for k in ("param5", "param6"):
+                    if math.isfinite(params[k]) and abs(params[k]) <= 180:
+                        params[k] = round(params[k] * 1e7)
+
             attacker_msg["command"] = cmd
+            print(f"[{msg_type} RX] cmd={cmd} params={params}", flush=True)
+        # ///////new handled long and int
 
-            print(f"[COMMAND_LONG RX] cmd={cmd}", flush=True)
-
-            
             # the - mission
             if cmd == mavutil.mavlink.MAV_CMD_MISSION_START:
                 ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
@@ -1802,16 +1828,18 @@ class LLMHoneypot:
             # B3) Other commands (ARM/DISARM/TAKEOFF/etc.)
             # ---------------------------
 
-            # --- B2) All other commands: route to LLM command pipeline ---
-            params = {
-                "param1": float(getattr(msg, "param1", 0.0)),
-                "param2": float(getattr(msg, "param2", 0.0)),
-                "param3": float(getattr(msg, "param3", 0.0)),
-                "param4": float(getattr(msg, "param4", 0.0)),
-                "param5": float(getattr(msg, "param5", 0.0)),
-                "param6": float(getattr(msg, "param6", 0.0)),
-                "param7": float(getattr(msg, "param7", 0.0)),
-            }
+            # ///////// new cmd long/int setup do not need this-------------
+            # # --- B2) All other commands: route to LLM command pipeline ---
+            # params = {
+            #     "param1": float(getattr(msg, "param1", 0.0)),
+            #     "param2": float(getattr(msg, "param2", 0.0)),
+            #     "param3": float(getattr(msg, "param3", 0.0)),
+            #     "param4": float(getattr(msg, "param4", 0.0)),
+            #     "param5": float(getattr(msg, "param5", 0.0)),
+            #     "param6": float(getattr(msg, "param6", 0.0)),
+            #     "param7": float(getattr(msg, "param7", 0.0)),
+            # }
+            # ///////// new cmd long/int setup do not need this-----------
 
             # ---- NEW: rule-based ACK ----
             result, reason= rule_based_ack(cmd, params, self.state)
@@ -1896,6 +1924,14 @@ class LLMHoneypot:
                 return
                 #the above skip_llm is supposed to stop bogus functions affecting the llm response.
 
+            #  cont. telem
+            self.direct_cmd, self.direct_params = cmd, dict(params)
+
+            with self.override_lock:
+                self.override_series.clear()
+            #  cont. telem
+
+
             # 1) heartbeat-only LLM module
             hb_resp = self.handle_command_heartbeat(cmd, params)
 
@@ -1910,6 +1946,19 @@ class LLMHoneypot:
         return
         # ////////////// telemetry /////////////////////
 
+
+    def tick_direct_command(self): # cont telem
+        if self.mission_state["active"] or self.direct_cmd is None:
+            return
+
+        with self.override_lock:
+            if self.override_series:
+                return
+
+        self.handle_command_telemetry(
+            self.direct_cmd,
+            self.direct_params
+        )
 
 
     # ---------------------------
@@ -1939,6 +1988,8 @@ class LLMHoneypot:
             maybe_start_uploaded_mission(self)
             start_or_tick_mission(self)
             # the - mission
+
+            self.tick_direct_command() # cont telem | jul 2026
 
             try:
                 data, addr = self.sock.recvfrom(4096)

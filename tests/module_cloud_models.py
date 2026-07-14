@@ -22,42 +22,6 @@ def load_gemini_key(key_file="gemini_api.txt"):
 GEMINI_API_KEY = load_gemini_key()
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-
-# def call_gemini_cloud(
-#     system_text: str,
-#     user_text: str,
-#     tag: str = "general",
-#     log_fn=None,
-# ) -> str:
-#     t0 = time.monotonic()
-
-#     try:
-#         response = client.models.generate_content(
-#             model=GEMINI_MODEL_NAME,
-#             contents=user_text,
-#             config=types.GenerateContentConfig(
-#                 system_instruction=system_text,
-#                 temperature=0,
-#                 top_p=0.9,
-#                 response_mime_type="application/json",
-#             ),
-#         )
-
-#         raw = response.text.strip() if response.text else ""
-#         dt_ms = (time.monotonic() - t0) * 1000.0
-
-#         parsed = extract_json(raw)
-
-#         if log_fn is not None:
-#             log_fn(tag, system_text, user_text, raw, parsed, dt_ms)
-
-#         return raw
-
-#     except Exception as e:
-#         print(f"[LLM GEMINI FAIL {tag}] {e}", flush=True)
-#         return ""
-
-
 def call_gemini_cloud(
     system_text: str,
     user_text: str,
