@@ -756,7 +756,7 @@ def retrieve_telemetry_examples_from_cmd_transition(rows, command_id: int, k: in
     return out
 
 
-# ///// Step 3 — retriever from px4_command_sequences.jsonl
+# ///// Step 3 — retriever from px4_command_sequences.jsonl ## updated retriever can include up to 5 of each telemetry type, maximum 25 telemetry messages total.
 def retrieve_telemetry_examples_from_sequences(rows, command_id: int, k: int = 2):
     """
     Retrieve followup telemetry examples from px4_command_sequences.jsonl.
@@ -782,7 +782,26 @@ def retrieve_telemetry_examples_from_sequences(rows, command_id: int, k: int = 2
         if cmd_id != int(command_id):
             continue
 
+        # future_telem = []
+        # followups = row.get("followups", [])
+
+        # if isinstance(followups, list):
+        #     for item in followups:
+        #         if not isinstance(item, dict):
+        #             continue
+
+        #         grouped = canonicalize_followup_message(item)
+
+        #         if grouped:
+        #             future_telem.append(grouped)
+
+        #         if len(future_telem) >= 5:
+        #             break
+        
+        # trying to update with 5x of each message type instead of top 5 whatever it gets || jul 2026
+
         future_telem = []
+        counts = {name: 0 for name in TELEM_GROUPS}
         followups = row.get("followups", [])
 
         if isinstance(followups, list):
@@ -790,13 +809,20 @@ def retrieve_telemetry_examples_from_sequences(rows, command_id: int, k: int = 2
                 if not isinstance(item, dict):
                     continue
 
+                name = item.get("type")
+
+                if name not in counts or counts[name] >= 5:
+                    continue
+
                 grouped = canonicalize_followup_message(item)
 
                 if grouped:
                     future_telem.append(grouped)
+                    counts[name] += 1
 
-                if len(future_telem) >= 5:
+                if all(count >= 5 for count in counts.values()):
                     break
+        # /////////////////
 
         ex = {
             "command": {

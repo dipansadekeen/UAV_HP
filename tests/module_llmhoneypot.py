@@ -122,7 +122,9 @@ class LLMHoneypot:
         # --- new telemetry-state-aware RAG rows --- || RAG
         attach_rag_to_hp(self,transition_path="../out/cmd_transition.jsonl",sequence_path="../out/px4_command_sequences.jsonl")
 
-        self.direct_cmd = self.direct_params = None #continous telem | jul 2026
+        self.direct_cmd = self.direct_params = None #continous telem | jul 2026 #new
+        self.home = None # for raw rtl #new
+        
 
     # to translate the commands # example: name : MAV_CMD_COMPONENT_ARM_DISARM -- giving enums to the model
     def get_command_name(self, command_id: int) -> str:
@@ -1622,15 +1624,52 @@ class LLMHoneypot:
                 finalize_mission_upload(self)
             return
 
+        # if msg_type == "SET_MODE":
+        #     base_mode = int(getattr(msg, "base_mode", 0))
+        #     custom_mode = int(getattr(msg, "custom_mode", 0))
+
+        #     print(f"[SET_MODE RX] base_mode={base_mode} custom_mode={custom_mode}", flush=True)
+
+        #     with self.state_lock:
+        #         self.state.base_mode = base_mode
+        #         self.state.custom_mode = custom_mode
+
+        #     return
+
+        # handle land and RTL without even mission: jul 2026
         if msg_type == "SET_MODE":
             base_mode = int(getattr(msg, "base_mode", 0))
             custom_mode = int(getattr(msg, "custom_mode", 0))
 
-            print(f"[SET_MODE RX] base_mode={base_mode} custom_mode={custom_mode}", flush=True)
-
             with self.state_lock:
                 self.state.base_mode = base_mode
                 self.state.custom_mode = custom_mode
+
+            main = (custom_mode >> 16) & 0xFF
+            sub  = (custom_mode >> 24) & 0xFF
+
+            cmd = {
+                (4, 6): 21,  # AUTO LAND
+                (4, 5): 20,  # AUTO RTL
+            }.get((main, sub))
+
+            if cmd is not None:
+                params = {f"param{i}": 0.0 for i in range(1, 8)}
+
+                # RTL target: saved home and current altitude
+                if cmd == 20 and self.home:
+                    with self.state_lock:
+                        params["param5"] = float(self.home["lat"])
+                        params["param6"] = float(self.home["lon"])
+                        params["param7"] = self.state.gpi_relative_alt / 1000.0
+
+                self.direct_cmd = cmd
+                self.direct_params = params
+
+                with self.override_lock:
+                    self.override_series.clear()
+
+                self.handle_command_telemetry(cmd, params)
 
             return
         # the - mission 
@@ -1855,11 +1894,48 @@ class LLMHoneypot:
             self.send_mav(ack_msg)          
 
             # if ack then prompt else not. #new
-            # ✅ ADD THIS CONDITION
+            # # ✅ ADD THIS CONDITION
+            # if result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            #     print(f"[LLM SKIPPED] cmd={cmd} because ACK={result}", flush=True)
+            #     return
+            # replacing with logging rx_ other than accepted---- jul 2026
             if result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                if cmd not in self.no_continuation_cmds:
+                    os.makedirs("logs", exist_ok=True)
+                    with open("logs/rx_other.jsonl", "a") as f:
+                        f.write(json.dumps({
+                            "ts": time.time(),
+                            "type": msg_type,
+                            "cmd": cmd,
+                            "params": params,
+                            "result": int(result),
+                            "reason": reason
+                        }) + "\n")
+
                 print(f"[LLM SKIPPED] cmd={cmd} because ACK={result}", flush=True)
                 return
-    
+            # replacing with logging rx_ other than accepted---- jul 2026            
+
+            # Store home when ARM is accepted # raw rtl #new
+            if cmd == 400 and int(round(params["param1"])) == 1:
+                with self.state_lock:
+                    self.home = {
+                        "lat": int(self.state.gpi_lat),
+                        "lon": int(self.state.gpi_lon),
+                    }# raw rtl #new
+            if cmd == 179:
+                with self.state_lock:
+                    self.home = {
+                        "lat": int(self.state.gpi_lat if int(params["param1"]) == 1 else params["param5"]),
+                        "lon": int(self.state.gpi_lon if int(params["param1"]) == 1 else params["param6"]),
+                    }
+
+                print(f"[HOME SET] lat={self.home['lat']} lon={self.home['lon']}", flush=True)
+                return # new set home ;;;
+
+
+            print(f"[HOME STORED] lat={self.home['lat']} lon={self.home['lon']}",flush=True) # new debug home 
+
             # QGC-critical state update # new jul
             self.apply_qgc_flight_state_from_cmd(cmd, params)
 
@@ -1917,12 +1993,15 @@ class LLMHoneypot:
 
             # return
             # /////////////////////////////////////////////////////
-            skip_llm = lambda c: c in {521}
+            # skip_llm = lambda c: c in {521}
 
-            if skip_llm(cmd):
+            # if skip_llm(cmd):
+            #     print(f"[LLM SKIP] cmd={cmd}", flush=True)
+            #     return
+            #     #the above skip_llm is supposed to stop bogus functions affecting the llm response.
+            if cmd in self.no_continuation_cmds: #new replacement from////
                 print(f"[LLM SKIP] cmd={cmd}", flush=True)
                 return
-                #the above skip_llm is supposed to stop bogus functions affecting the llm response.
 
             #  cont. telem
             self.direct_cmd, self.direct_params = cmd, dict(params)
@@ -1934,6 +2013,8 @@ class LLMHoneypot:
 
             # 1) heartbeat-only LLM module
             hb_resp = self.handle_command_heartbeat(cmd, params)
+
+            if cmd == 400: self.direct_cmd = self.direct_params = None; return # custom : avoid 400 for telem ; jul 2026 #new
 
             # 2) telemetry module will be added later
             telem_resp = self.handle_command_telemetry(cmd, params)

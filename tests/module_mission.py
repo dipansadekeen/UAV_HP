@@ -2,12 +2,25 @@
 import time
 from pymavlink import mavutil
 import math
-
+import time, math, os, csv
+from datetime import datetime
 MISSION_CMD_WAYPOINT = 16
 MISSION_CMD_TAKEOFF = 22
 MISSION_CMD_LAND = 21
 MISSION_CMD_RTL = 20
 MISSION_CMD_CHANGE_SPEED = 178
+
+# ///////////// log the attacker mission
+def next_mission_id(path="logs/mission_uploads.csv"):
+    try:
+        with open(path, newline="") as f:
+            return max((int(r["mission_id"]) for r in csv.DictReader(f)), default=0) + 1
+    except:
+        return 1
+# ///////////// log the attacker mission
+
+
+
 
 def _current_speed_mps(hp):
     with hp.state_lock:
@@ -45,6 +58,8 @@ def init_mission_state(hp):
     }
 
 def handle_mission_count(hp, msg):
+    hp.mission_id = next_mission_id() #log
+    hp.mission_run_id = time.strftime("mission_%Y%m%d_%H%M%S") #log
     hp.mission_state["expected_count"] = int(getattr(msg, "count", 0))
     hp.mission_state["items"] = {}
     hp.mission_state["ready"] = False
@@ -93,14 +108,55 @@ def send_mission_ack(hp, ack_type=0):
     hp.send_mav(msg)
 
 
-def finalize_mission_upload(hp):
+# def finalize_mission_upload(hp):
+#     hp.mission_state["ready"] = True
+#     # current mission # new
+#     with hp.state_lock:
+#         hp.state.mission_seq = 0
+
+#     send_mission_ack(hp, 0)
+#     print("[MISSION] upload accepted", flush=True)
+
+def finalize_mission_upload(hp): #with log # new
+    if hp.mission_state["ready"]:
+        return
+
     hp.mission_state["ready"] = True
-    # current mission # new
+
     with hp.state_lock:
         hp.state.mission_seq = 0
 
+    path = "logs/mission_uploads.csv"
+    os.makedirs("logs", exist_ok=True)
+    new = not os.path.exists(path)
+
+    cols = [
+        "mission_id", "mission_run_id", "time",
+        "seq", "command", "frame", "x", "y", "z",
+        "param1", "param2", "param3", "param4"
+    ]
+
+    uploaded = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        if new:
+            w.writeheader()
+
+        for seq in sorted(hp.mission_state["items"]):
+            w.writerow({
+                "mission_id": hp.mission_id,
+                "mission_run_id": hp.mission_run_id,
+                "time": uploaded,
+                **hp.mission_state["items"][seq]
+            })
+
     send_mission_ack(hp, 0)
-    print("[MISSION] upload accepted", flush=True)
+    print(
+        f"[MISSION] logged id={hp.mission_id} "
+        f"run={hp.mission_run_id}",
+        flush=True
+    )
 
 
 # def start_mission(hp):
