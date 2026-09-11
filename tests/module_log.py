@@ -33,6 +33,11 @@ def log_mission_llm_csv(hp, command_id, command_name, params, user_payload, pars
 
     with hp.state_lock:
         input_state = {
+
+            "input_hb_base_mode": getattr(hp.state, "base_mode", None),
+            "input_hb_custom_mode": getattr(hp.state, "custom_mode", None),
+            "input_hb_system_status": getattr(hp.state, "system_status", None),
+
             "input_gpi_lat": getattr(hp.state, "gpi_lat", None),
             "input_gpi_lon": getattr(hp.state, "gpi_lon", None),
             "input_gpi_alt": getattr(hp.state, "gpi_alt", None),
@@ -88,6 +93,11 @@ def log_mission_llm_csv(hp, command_id, command_name, params, user_payload, pars
         "dt",
         "llm_latency_ms", # new
         "llm_model_name", # new
+
+
+        "input_hb_base_mode",
+        "input_hb_custom_mode",
+        "input_hb_system_status",
 
         "input_gpi_lat",
         "input_gpi_lon",

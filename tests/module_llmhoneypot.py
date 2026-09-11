@@ -8,6 +8,7 @@ from collections import deque
 from typing import Dict, Any, Optional
 from pymavlink import mavutil
 from module_historybuffer_commonstate import CommonState, HistoryBuffer
+
 from module_helper_functions import (
     load_command_rag_jsonl,
     rag_retrieve_examples,
@@ -124,7 +125,21 @@ class LLMHoneypot:
 
         self.direct_cmd = self.direct_params = None #continous telem | jul 2026 #new
         self.home = None # for raw rtl #new
-        
+
+        self.cmd_token = 0 #threading commands so new cmd can interrupt -- new new command override
+
+    def start_cmd(self, cmd, params): #threading commands so new cmd can interrupt -- new command override
+        self.cmd_token += 1
+        with self.override_lock:
+            self.override_series.clear()
+
+        threading.Thread(
+            target=lambda: (
+                self.handle_command_heartbeat(cmd, params),
+                cmd != 400 and self.handle_command_telemetry(cmd, params)
+            ),
+            daemon=True
+        ).start() #threading commands so new cmd can interrupt -- new
 
     # to translate the commands # example: name : MAV_CMD_COMPONENT_ARM_DISARM -- giving enums to the model
     def get_command_name(self, command_id: int) -> str:
@@ -507,8 +522,12 @@ class LLMHoneypot:
     # ---------------------------
 
     OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://192.168.1.100:11434")
-    OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
-    OLLAMA_TIMEOUT_SEC = 20
+    OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+    # OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "nemotron-3-nano")
+            # model_name = "nemotron-3-nano:30b-cloud" # new
+        # model_name = "gemma4:31b-cloud" # new
+        # model_name = "glm-5.2:cloud" # new
+    OLLAMA_TIMEOUT_SEC = 90
 
     # LLM_OUTPUT_RULES = """
     # Return ONLY valid JSON in this exact shape:
@@ -535,7 +554,7 @@ class LLMHoneypot:
 
     Rules:
     - telemetry_series covers ~1-3 seconds, dt is non-decreasing.
-    - Only use fields that exist in CommonState.
+    - Only use fields that exist in CommonState.aa
     - Keep values plausible.
     Units (MUST follow):
     - gps_lat, gps_lon, gpi_lat, gpi_lon: integer in range -900000000 to 900000000
@@ -547,7 +566,13 @@ class LLMHoneypot:
     # new ///
     def call_ollama_cloud(self, system_text: str, user_text: str, tag: str = "general") -> str:
         t0 = time.monotonic()
-        model_name = "gpt-oss:20b-cloud" # new
+        # model_name = "gpt-oss:20b-cloud" # new
+        model_name = "nemotron-3-super:cloud" # new
+        # model_name = "nemotron-3-nano:30b-cloud" # new
+        # model_name = "gemma4:31b-cloud" # new
+        # model_name = "gpt-oss:120b-cloud" # new
+
+
         try:
             with open("api_key.txt", "r") as f:
                 api_key = f.read().strip()
@@ -607,8 +632,8 @@ class LLMHoneypot:
             "stream": False,
             "format": "json",  #  FORCE VALID JSON
             "options": {
-                "temperature": 0.2
-                # "top_p": 1
+                "temperature": 0,
+                "top_p": 0.9
             }
         }
         t0 = time.monotonic()
@@ -781,8 +806,8 @@ class LLMHoneypot:
             # raw = call_ollama(LLM_OUTPUT_RULES, user_text)
             # print("\n[LLM PROMPT] system_text:\n", system_text)
             # print("\n[LLM PROMPT] user_text:\n", user_text)
-            # raw = self.call_ollama(system_text, user_text)
-            raw = self.call_ollama(system_text, user_text, tag=context_type)
+            raw = self.call_ollama(system_text, user_text)
+            # raw = self.call_ollama(system_text, user_text, tag=context_type)
 
 
             # -------------------------
@@ -1042,6 +1067,7 @@ class LLMHoneypot:
         Side effect:
         - applies heartbeat patch once if valid
         """
+        token = self.cmd_token # new cmd can interrupt command override
         fewshot_seq = retrieve_heartbeat_examples_from_sequences(self.cmd_seq_rows, command_id, k=5)
         fewshot_trace = []   # keep trace disabled for heartbeat for now
         # 1) collect only previous heartbeat
@@ -1126,6 +1152,9 @@ class LLMHoneypot:
 
             # raw = self.call_ollama(system_text, user_text, tag="heartbeat_command") #original
             raw = self.call_ollama_cloud(system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
+            if token is not None and token != self.cmd_token: #new command override
+                print(f"[OLD TELEM IGNORED] cmd={command_id}", flush=True)
+                return None            
             parsed = extract_json(raw)
 
             print("\n[HB LLM RAW RESPONSE]")
@@ -1266,7 +1295,7 @@ class LLMHoneypot:
           - transition examples from cmd_transition.jsonl
           - sequence followup examples from px4_command_sequences.jsonl
         """
-
+        token = self.cmd_token # new command overrides
         last_5_telem = self.get_last_5_telemetry_snapshots()
         current_hb = self.get_current_heartbeat_snapshot()
 
@@ -1403,7 +1432,7 @@ class LLMHoneypot:
         - If altitude decreases, climb should be negative or zero.
         - Do not abruptly change direction unless already indicated by current telemetry.
         - Keep velocity, altitude, and heading changes smooth and consistent.
-        
+
         Kinematic realism:
         - First update position: GLOBAL_POSITION_INT.lat/lon/relative_alt and VFR_HUD.alt.
         - VFR_HUD.alt is meters; GLOBAL_POSITION_INT.relative_alt is millimeters, so relative_alt = VFR_HUD.alt × 1000.
@@ -1417,7 +1446,7 @@ class LLMHoneypot:
         - ATTITUDE.yaw must match heading in radians.
         - Pitch should be near 0, slightly positive during climb, and slightly negative during descent.
         - Roll should be near 0 unless the drone is turning.
-
+        
         Return JSON only.
         """.strip()
         user_payload = {
@@ -1441,6 +1470,52 @@ class LLMHoneypot:
             "allowed_telemetry_groups": TELEM_GROUPS,
             "instruction": "Generate the next 5 telemetry states using canonical MAVLink field names grouped by message."
         }
+        # - For normal waypoint flight, choose groundspeed around 8–10.
+        # Kinematic realism:
+        # - Treat each generated step as 0.5 s after the previous state.
+        # - For dt=0.5, use the latest live telemetry; afterward use the previous generated state.
+        # - Do not choose position and velocity independently.
+
+        # Horizontal motion:
+        # - Choose north/east velocity vn, ve toward the target.
+        # - Enforce:
+        #     north_displacement = vn × 0.5
+        #     east_displacement  = ve × 0.5
+        # - Set:
+        #     GLOBAL_POSITION_INT.vx = round(vn × 100)
+        #     GLOBAL_POSITION_INT.vy = round(ve × 100)
+        #     VFR_HUD.groundspeed = sqrt(vn² + ve²)
+        # - Update lat/lon using the same displacement.
+        # - If the target is closer than one normal step, reduce velocity and stop at the target; never snap to it with inconsistent velocity.
+
+        # Vertical motion:
+        # - Enforce:
+        #     altitude_change = climb × 0.5
+        # - Set:
+        #     VFR_HUD.climb = climb
+        #     GLOBAL_POSITION_INT.vz = round(-climb × 100)
+        # - relative_alt must change by altitude_change × 1000.
+
+        # Heading:
+        # - Heading must follow the horizontal velocity direction.
+        # - GLOBAL_POSITION_INT.hdg = VFR_HUD.heading × 100.
+        # - ATTITUDE.yaw must match heading in radians.
+
+
+        # Kinematic realism:
+        # - First update position: GLOBAL_POSITION_INT.lat/lon/relative_alt and VFR_HUD.alt.
+        # - VFR_HUD.alt is meters; GLOBAL_POSITION_INT.relative_alt is millimeters, so relative_alt = VFR_HUD.alt × 1000.
+        # - For normal waypoint flight, choose groundspeed around 8–10.
+        # - For takeoff/landing, keep horizontal groundspeed low, around 0 m/s.
+        # - If groundspeed is 0, lat/lon must not change.
+        # - If the waypoint is closer than the allowed movement, slow down and stop at the target.
+        # - vx/vy/vz must describe the same movement shown by lat/lon/altitude. Use cm/s integers.
+        # - VFR_HUD.heading must point in the same direction as lat/lon movement.
+        # - GLOBAL_POSITION_INT.hdg = VFR_HUD.heading × 100.
+        # - ATTITUDE.yaw must match heading in radians.
+        # - Pitch should be near 0, slightly positive during climb, and slightly negative during descent.
+        # - Roll should be near 0 unless the drone is turning.
+
 
         user_text = json.dumps(user_payload)
 
@@ -1450,9 +1525,12 @@ class LLMHoneypot:
 
             # raw = self.call_ollama(system_text, user_text, tag="telemetry_command")
 
-            raw = self.call_ollama_cloud(system_text, user_text, tag="telemetry_command")
+            raw = self.call_ollama_cloud(system_text, user_text, tag="telemetry_command") #uncomment
 
-
+            if token != self.cmd_token: # new cmd override
+                print(f"[OLD RESPONSE IGNORED] cmd={command_id}", flush=True)
+                return None
+            
             # # comment use when gemini #
             # gemini_result = call_gemini_cloud(system_text, user_text, tag="telemetry_command", model_name="gemini-2.5-flash",log_fn=self.log_llm_io, return_meta=True,)
             # raw = gemini_result["raw"]
@@ -1584,8 +1662,8 @@ class LLMHoneypot:
                         return False
 
         return True
-    # for telemetry based on commands /////////
 
+    # for telemetry based on commands /////////
     def handle_inbound_msg(self, msg):
         """
         # Handles inbound MAVLink messages from the GCS.
@@ -2011,13 +2089,14 @@ class LLMHoneypot:
             #  cont. telem
 
 
-            # 1) heartbeat-only LLM module
-            hb_resp = self.handle_command_heartbeat(cmd, params)
+            # # 1) heartbeat-only LLM module
+            # hb_resp = self.handle_command_heartbeat(cmd, params)
 
-            if cmd == 400: self.direct_cmd = self.direct_params = None; return # custom : avoid 400 for telem ; jul 2026 #new
+            # if cmd == 400: self.direct_cmd = self.direct_params = None; return # custom : avoid 400 for telem ; jul 2026 #new
 
-            # 2) telemetry module will be added later
-            telem_resp = self.handle_command_telemetry(cmd, params)
+            # # 2) telemetry module will be added later
+            # telem_resp = self.handle_command_telemetry(cmd, params)
+            self.start_cmd(cmd, params)
 
             return
 

@@ -927,6 +927,252 @@ def rule_based_ack(cmd, params, state):
     
 
     return mavutil.mavlink.MAV_RESULT_UNSUPPORTED, "unsupported command"
+# def rule_based_ack(cmd, params, state):
+#     """
+#     ACK decision using the learned finite-state automaton.
+
+#     States:
+#         DG       = Disarmed Ground
+#         AG       = Armed Ground
+#         TAKEOFF  = Taking off
+#         AIR      = In air
+#         LANDING  = Landing
+
+#     Returns:
+#         (MAV_RESULT, reason)
+#     """
+
+#     # ============================================================
+#     # 1. Read current UAV condition
+#     # ============================================================
+
+#     armed = _is_armed(state)
+#     alt = _alt_m(state)
+
+#     # Get MAV_LANDED_STATE if available
+#     if isinstance(state, dict):
+#         landed_state = state.get("landed_state", None)
+#     else:
+#         landed_state = getattr(state, "landed_state", None)
+
+
+#     # ============================================================
+#     # 2. Convert telemetry -> Automaton state
+#     # ============================================================
+
+#     if not armed:
+#         auto_state = "DG"
+
+#     elif landed_state == 1:
+#         # MAV_LANDED_STATE_ON_GROUND
+#         auto_state = "AG"
+
+#     elif landed_state == 3:
+#         # MAV_LANDED_STATE_TAKEOFF
+#         auto_state = "TAKEOFF"
+
+#     elif landed_state == 4:
+#         # MAV_LANDED_STATE_LANDING
+#         auto_state = "LANDING"
+
+#     elif landed_state == 2:
+#         # MAV_LANDED_STATE_IN_AIR
+#         auto_state = "AIR"
+
+#     else:
+#         # Fallback when landed_state is unavailable
+#         if armed and alt < 0.3:
+#             auto_state = "AG"
+#         else:
+#             auto_state = "AIR"
+
+
+#     # ============================================================
+#     # 3. Convert MAVLink command -> Automaton event
+#     # ============================================================
+
+#     if cmd == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+
+#         arm_flag = int(round(float(params.get("param1", 0.0))))
+
+#         if arm_flag == 1:
+#             event = "ARM"
+#         else:
+#             event = "DISARM"
+
+#     elif cmd == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF:
+#         event = "TAKEOFF"
+
+#     elif cmd == mavutil.mavlink.MAV_CMD_NAV_LAND:
+#         event = "LAND"
+
+#     elif cmd == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
+#         event = "WAYPOINT"
+
+#     elif cmd == getattr(
+#         mavutil.mavlink,
+#         "MAV_CMD_DO_REPOSITION",
+#         192
+#     ):
+#         event = "REPOSITION"
+
+#     elif cmd == mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH:
+#         event = "RTL"
+
+#     else:
+#         return (
+#             mavutil.mavlink.MAV_RESULT_UNSUPPORTED,
+#             f"automaton: {auto_state} + UNKNOWN -> unsupported"
+#         )
+
+
+#     # ============================================================
+#     # 4. ACK Automaton
+#     #
+#     # Format:
+#     # current_state + command
+#     #       -> (ACK result, expected next state)
+#     # ============================================================
+
+#     A  = mavutil.mavlink.MAV_RESULT_ACCEPTED
+#     TR = mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED
+#     D  = mavutil.mavlink.MAV_RESULT_DENIED
+#     U  = mavutil.mavlink.MAV_RESULT_UNSUPPORTED
+
+
+#     AUTOMATON = {
+
+#         # --------------------------------------------------------
+#         # Disarmed on ground
+#         # --------------------------------------------------------
+#         "DG": {
+#             "ARM":       (A,  "AG"),
+#             "DISARM":    (A,  "DG"),
+
+#             # Observed PX4 behavior
+#             "TAKEOFF":   (A,  "DG"),
+#             "LAND":      (A,  "DG"),
+#             "RTL":       (A,  "DG"),
+
+#             "WAYPOINT":  (U,  "DG"),
+#             "REPOSITION":(U,  "DG"),
+#         },
+
+
+#         # --------------------------------------------------------
+#         # Armed on ground
+#         # --------------------------------------------------------
+#         "AG": {
+#             "ARM":       (A,  "AG"),
+#             "DISARM":    (A,  "DG"),
+
+#             "TAKEOFF":   (A,  "TAKEOFF"),
+
+#             "LAND":      (A,  "AG"),
+#             "RTL":       (A,  "AG"),
+
+#             "WAYPOINT":  (U,  "AG"),
+#             "REPOSITION":(U,  "AG"),
+#         },
+
+
+#         # --------------------------------------------------------
+#         # Vehicle taking off
+#         # --------------------------------------------------------
+#         "TAKEOFF": {
+#             "ARM":       (A,  "TAKEOFF"),
+
+#             # Observed: disarm while taking off was temporarily
+#             # rejected
+#             "DISARM":    (TR, "TAKEOFF"),
+
+#             # TAKEOFF again was accepted
+#             "TAKEOFF":   (A,  "AIR"),
+
+#             "LAND":      (A,  "LANDING"),
+#             "RTL":       (A,  "LANDING"),
+
+#             "WAYPOINT":  (U,  "TAKEOFF"),
+#             "REPOSITION":(U,  "TAKEOFF"),
+#         },
+
+
+#         # --------------------------------------------------------
+#         # Vehicle in the air
+#         # --------------------------------------------------------
+#         "AIR": {
+#             "ARM":       (A,  "AIR"),
+#             "DISARM":    (TR, "AIR"),
+
+#             "TAKEOFF":   (A,  "AIR"),
+
+#             "LAND":      (A,  "LANDING"),
+#             "RTL":       (A,  "LANDING"),
+
+#             "WAYPOINT":  (U,  "AIR"),
+#             "REPOSITION":(U,  "AIR"),
+#         },
+
+
+#         # --------------------------------------------------------
+#         # Vehicle landing
+#         # --------------------------------------------------------
+#         "LANDING": {
+#             "ARM":       (TR, "LANDING"),
+
+#             "DISARM":    (A,  "DG"),
+
+#             "TAKEOFF":   (TR, "LANDING"),
+
+#             "LAND":      (A,  "LANDING"),
+#             "RTL":       (A,  "LANDING"),
+
+#             "WAYPOINT":  (U,  "LANDING"),
+#             "REPOSITION":(U,  "LANDING"),
+#         },
+#     }
+
+
+#     # ============================================================
+#     # 5. Ask the automaton for the decision
+#     # ============================================================
+
+#     transition = AUTOMATON.get(
+#         auto_state, {}
+#     ).get(event)
+
+
+#     if transition is None:
+#         return (
+#             U,
+#             f"automaton: {auto_state} + {event} -> unsupported"
+#         )
+
+
+#     result, next_state = transition
+
+
+#     # ============================================================
+#     # 6. Human-readable reason for logging
+#     # ============================================================
+
+#     result_names = {
+#         A:  "ACCEPTED",
+#         TR: "TEMPORARILY_REJECTED",
+#         D:  "DENIED",
+#         U:  "UNSUPPORTED",
+#     }
+
+#     result_name = result_names.get(result, str(result))
+
+#     reason = (
+#         f"automaton: {auto_state} + {event}"
+#         f" -> {result_name}"
+#         f" -> {next_state}"
+#     )
+
+
+#     return result, reason
 #  /////////// command_ack //////////
 
 def init_home_once(state: CommonState):
