@@ -567,9 +567,9 @@ class LLMHoneypot:
     def call_ollama_cloud(self, system_text: str, user_text: str, tag: str = "general") -> str:
         t0 = time.monotonic()
         # model_name = "gpt-oss:20b-cloud" # new
-        model_name = "nemotron-3-super:cloud" # new
+        # model_name = "nemotron-3-super:cloud" # new
         # model_name = "nemotron-3-nano:30b-cloud" # new
-        # model_name = "gemma4:31b-cloud" # new
+        model_name = "gemma4:31b-cloud" # new
         # model_name = "gpt-oss:120b-cloud" # new
 
 
@@ -1405,6 +1405,7 @@ class LLMHoneypot:
         - Always include SYS_STATUS.battery_remaining.
         - If a field does not need to change, keep it unchanged or omit it.
         - Keep telemetry internally consistent across message groups.
+        - Beware of the altitude
 
         Command-specific behavior:
         - ARM/DISARM (400): may change armed-related behavior, but must not simulate takeoff unless a takeoff command is given.
@@ -1959,7 +1960,10 @@ class LLMHoneypot:
             # ///////// new cmd long/int setup do not need this-----------
 
             # ---- NEW: rule-based ACK ----
-            result, reason= rule_based_ack(cmd, params, self.state)
+            # result, reason= rule_based_ack(cmd, params, self.state)
+
+            with self.state_lock: # automaton new
+                result, reason, execute = rule_based_ack( cmd, params, self.state, with_effect=True)
             
             result_name = mavutil.mavlink.enums["MAV_RESULT"][int(result)].name #debug
             print(f"[ACK RULE] cmd={cmd} result={result_name} reason={reason}", flush=True) #debug
@@ -1993,6 +1997,16 @@ class LLMHoneypot:
                 print(f"[LLM SKIPPED] cmd={cmd} because ACK={result}", flush=True)
                 return
             # replacing with logging rx_ other than accepted---- jul 2026            
+
+            # THIS NEW BLOCK HERE: #new for ack_automata.
+            if not execute:
+                print(
+                    f"[LLM SKIPPED] cmd={cmd}: accepted without new action; "
+                    f"reason={reason}",
+                    flush=True
+                )
+                return
+
 
             # Store home when ARM is accepted # raw rtl #new
             if cmd == 400 and int(round(params["param1"])) == 1:

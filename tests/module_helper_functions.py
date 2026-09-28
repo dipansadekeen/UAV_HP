@@ -867,66 +867,354 @@ def _alt_m(state) -> float:
         return float(getattr(state, "gps_alt", 0)) / 1000.0
     return 0.0
 
-def rule_based_ack(cmd, params, state):
-    alt = _alt_m(state)
-    armed = _is_armed(state)
+# def rule_based_ack(cmd, params, state):
+#     alt = _alt_m(state)
+#     armed = _is_armed(state)
 
-    # ARM/DISARM (400)
-    if cmd == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
-        arm_flag = int(round(float(params.get("param1", 0.0))))
+#     # ARM/DISARM (400)
+#     if cmd == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+#         arm_flag = int(round(float(params.get("param1", 0.0))))
 
-        if arm_flag == 1:  # ARM
-            if not armed:
-                return mavutil.mavlink.MAV_RESULT_ACCEPTED, "arm allowed"
-            else:
-                return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "already armed"
+#         if arm_flag == 1:  # ARM
+#             if not armed:
+#                 return mavutil.mavlink.MAV_RESULT_ACCEPTED, "arm allowed"
+#             else:
+#                 return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "already armed"
 
-        else:  # DISARM
-            if alt < 0.2:
-                return mavutil.mavlink.MAV_RESULT_ACCEPTED, "disarm allowed"
-            else:
-                return mavutil.mavlink.MAV_RESULT_DENIED, "cannot disarm in air"
+#         else:  # DISARM
+#             if alt < 0.2:
+#                 return mavutil.mavlink.MAV_RESULT_ACCEPTED, "disarm allowed"
+#             else:
+#                 return mavutil.mavlink.MAV_RESULT_DENIED, "cannot disarm in air"
 
-    # TAKEOFF (22)
-    if cmd == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF:
-        target_alt = float(params.get("param7", 3.0))
+#     # TAKEOFF (22)
+#     if cmd == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF:
+#         target_alt = float(params.get("param7", 3.0))
 
-        if armed and alt < 0.3 and target_alt > 0.5:
-            return mavutil.mavlink.MAV_RESULT_ACCEPTED, "takeoff allowed"
-        else:
-            return mavutil.mavlink.MAV_RESULT_DENIED, "takeoff preconditions failed"
+#         if armed and alt < 0.3 and target_alt > 0.5:
+#             return mavutil.mavlink.MAV_RESULT_ACCEPTED, "takeoff allowed"
+#         else:
+#             return mavutil.mavlink.MAV_RESULT_DENIED, "takeoff preconditions failed"
 
-    # LAND (21)
-    if cmd == mavutil.mavlink.MAV_CMD_NAV_LAND:
-        if armed and alt > 0.5:
-            return mavutil.mavlink.MAV_RESULT_ACCEPTED, "landing allowed"
-        else:
-            return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "not flying"
+#     # LAND (21)
+#     if cmd == mavutil.mavlink.MAV_CMD_NAV_LAND:
+#         if armed and alt > 0.5:
+#             return mavutil.mavlink.MAV_RESULT_ACCEPTED, "landing allowed"
+#         else:
+#             return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "not flying"
 
-    # WAYPOINT (16)
-    if cmd == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
-        if armed:
-            return mavutil.mavlink.MAV_RESULT_ACCEPTED, "waypoint accepted"
-        else:
-            return mavutil.mavlink.MAV_RESULT_DENIED, "not armed"
+#     # WAYPOINT (16)
+#     if cmd == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
+#         if armed:
+#             return mavutil.mavlink.MAV_RESULT_ACCEPTED, "waypoint accepted"
+#         else:
+#             return mavutil.mavlink.MAV_RESULT_DENIED, "not armed"
         
-    # DO_REPOSITION / QGC Go To Location # new jul
-    if cmd == getattr(mavutil.mavlink, "MAV_CMD_DO_REPOSITION", 192):
-        if armed and alt > 0.5:
-            return mavutil.mavlink.MAV_RESULT_ACCEPTED, "reposition accepted"
-        else:
-            return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "not flying"
+#     # DO_REPOSITION / QGC Go To Location # new jul
+#     if cmd == getattr(mavutil.mavlink, "MAV_CMD_DO_REPOSITION", 192):
+#         if armed and alt > 0.5:
+#             return mavutil.mavlink.MAV_RESULT_ACCEPTED, "reposition accepted"
+#         else:
+#             return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "not flying"
 
-    # RTL (20) #new jul
-    if cmd == mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH:
-        if armed and alt > 0.5:
-            return mavutil.mavlink.MAV_RESULT_ACCEPTED, "rtl accepted"
-        else:
-            return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "not flying"
+#     # RTL (20) #new jul
+#     if cmd == mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH:
+#         if armed and alt > 0.5:
+#             return mavutil.mavlink.MAV_RESULT_ACCEPTED, "rtl accepted"
+#         else:
+#             return mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED, "not flying"
         
     
 
-    return mavutil.mavlink.MAV_RESULT_UNSUPPORTED, "unsupported command"
+#     return mavutil.mavlink.MAV_RESULT_UNSUPPORTED, "unsupported command"
+
+def rule_based_ack(cmd, params, state, *, with_effect=False):
+    """
+    Table-driven command-decision automaton (EFSM).
+
+    Default return:
+        (result, reason)
+
+    With with_effect=True:
+        (result, reason, execute)
+
+    The current phase is observed from the supplied vehicle state.
+    The selected transition describes the requested action.
+
+    This function does not update telemetry or call the LLM.
+    The caller handles execution after receiving the decision.
+    """
+    import math
+
+    mav = mavutil.mavlink
+
+    ACCEPT = mav.MAV_RESULT_ACCEPTED
+    TEMP = mav.MAV_RESULT_TEMPORARILY_REJECTED
+    DENY = mav.MAV_RESULT_DENIED
+    UNSUPPORTED = mav.MAV_RESULT_UNSUPPORTED
+
+    # ---------------------------------------------------------
+    # 1. Automaton states
+    # ---------------------------------------------------------
+    DG = "DISARMED_GROUND"
+    AG = "ARMED_GROUND"
+    TO = "TAKING_OFF"
+    FL = "FLYING"
+    LD = "LANDING"
+    BAD = "INCONSISTENT"
+
+    alt = _alt_m(state)
+    armed = _is_armed(state)
+    landed = int(getattr(
+        state, "landed_state", mav.MAV_LANDED_STATE_UNDEFINED
+    ))
+
+    # Observe the current state using your existing classification.
+    if not math.isfinite(alt):
+        phase = BAD
+    elif not armed:
+        phase = (
+            DG
+            if landed == mav.MAV_LANDED_STATE_ON_GROUND and alt < 0.5
+            else BAD
+        )
+    elif landed == mav.MAV_LANDED_STATE_TAKEOFF:
+        phase = TO
+    elif landed == mav.MAV_LANDED_STATE_LANDING:
+        phase = LD
+    elif landed == mav.MAV_LANDED_STATE_IN_AIR or alt > 0.5:
+        phase = FL
+    else:
+        phase = AG
+
+    # ---------------------------------------------------------
+    # 2. Input values used by transition guards
+    # ---------------------------------------------------------
+    def number(key, default):
+        try:
+            return float(params.get(key, default))
+        except (TypeError, ValueError):
+            return float("nan")
+
+    arm = (
+        number("param1", 0.0)
+        if cmd == mav.MAV_CMD_COMPONENT_ARM_DISARM
+        else float("nan")
+    )
+
+    target_alt = (
+        number("param7", 3.0)
+        if cmd == mav.MAV_CMD_NAV_TAKEOFF
+        else float("nan")
+    )
+
+    def always():
+        return True
+
+    # ---------------------------------------------------------
+    # 3. Transition relation
+    #
+    # Each transition contains:
+    # (
+    #     source_states,
+    #     guard,
+    #     target_state,
+    #     ACK_result,
+    #     reason,
+    #     execute
+    # )
+    #
+    # source_states=None: match any current state.
+    # target_state=None: remain in the current state.
+    #
+    # Priority is top to bottom: select the FIRST enabled edge.
+    # ---------------------------------------------------------
+    transitions = {
+        mav.MAV_CMD_COMPONENT_ARM_DISARM: (
+            (
+                None, lambda: arm not in (0.0, 1.0),
+                None, DENY,
+                "invalid arm/disarm parameter", False
+            ),
+            (
+                (DG,), lambda: arm == 1.0,
+                AG, ACCEPT,
+                "{source} -> {target}", True
+            ),
+            (
+                (BAD,), lambda: arm == 1.0,
+                None, DENY,
+                "inconsistent vehicle state", False
+            ),
+            (
+                None, lambda: arm == 1.0,
+                None, ACCEPT,
+                "already armed; no new action", False
+            ),
+            (
+                (DG,), always,
+                None, ACCEPT,
+                "already disarmed; no new action", False
+            ),
+            (
+                (AG,), lambda: alt < 0.2,
+                DG, ACCEPT,
+                "{source} -> {target}", True
+            ),
+            (
+                (LD,), always,
+                None, ACCEPT,
+                "landing in progress; disarm not yet applied", False
+            ),
+            (
+                None, always,
+                None, TEMP,
+                "cannot disarm before landing", False
+            ),
+        ),
+
+        mav.MAV_CMD_NAV_TAKEOFF: (
+            (
+                None,
+                lambda: not math.isfinite(target_alt) or target_alt <= 0,
+                None, DENY,
+                "invalid takeoff altitude", False
+            ),
+            (
+                (DG,), always,
+                None, ACCEPT,
+                "disarmed takeoff acknowledged; no flight", False
+            ),
+            (
+                (TO,), always,
+                None, ACCEPT,
+                "takeoff already in progress", False
+            ),
+            (
+                (AG,), lambda: alt < 0.3 and target_alt <= 0.5,
+                None, ACCEPT,
+                "low takeoff target acknowledged; no flight", False
+            ),
+            (
+                (AG,), lambda: alt < 0.3,
+                TO, ACCEPT,
+                "{source} -> {target}", True
+            ),
+            (
+                None, always,
+                None, DENY,
+                "takeoff preconditions failed", False
+            ),
+        ),
+
+        mav.MAV_CMD_NAV_LAND: (
+            (
+                (DG, AG, LD), always,
+                None, ACCEPT,
+                "{source}: land acknowledged; no new action", False
+            ),
+            (
+                (TO, FL), always,
+                LD, ACCEPT,
+                "{source} -> {target}", True
+            ),
+            (
+                None, always,
+                None, TEMP,
+                "not in flight", False
+            ),
+        ),
+
+        # RTL, WAYPOINT, and REPOSITION are flight actions.
+        # They do not introduce additional flight-phase states.
+        mav.MAV_CMD_NAV_RETURN_TO_LAUNCH: (
+            (
+                (DG, AG), always,
+                None, ACCEPT,
+                "{source}: RTL acknowledged; no flight", False
+            ),
+            (
+                (TO, FL), lambda: alt > 0.5,
+                FL, ACCEPT,
+                "{source} -> RTL", True
+            ),
+            (
+                None, always,
+                None, TEMP,
+                "RTL requires active flight", False
+            ),
+        ),
+
+        mav.MAV_CMD_NAV_WAYPOINT: (
+            (
+                (FL,), always,
+                FL, ACCEPT,
+                "FLYING -> WAYPOINT", True
+            ),
+            (
+                (DG, TO), always,
+                None, UNSUPPORTED,
+                "waypoint unsupported during {source}", False
+            ),
+            (
+                None, always,
+                None, DENY,
+                "waypoint requires active flight ({source})", False
+            ),
+        ),
+
+        getattr(mav, "MAV_CMD_DO_REPOSITION", 192): (
+            (
+                (FL,), always,
+                FL, ACCEPT,
+                "FLYING -> REPOSITION", True
+            ),
+            (
+                (DG, TO), always,
+                None, UNSUPPORTED,
+                "reposition unsupported during {source}", False
+            ),
+            (
+                None, always,
+                None, TEMP,
+                "reposition requires active flight ({source})", False
+            ),
+        ),
+    }
+
+    fallback = (
+        (
+            None, always,
+            None, UNSUPPORTED,
+            "unsupported command", False
+        ),
+    )
+
+    # ---------------------------------------------------------
+    # 4. Generic automaton engine
+    # ---------------------------------------------------------
+    for transition in transitions.get(cmd, fallback):
+        sources, guard, target, result, reason, execute = transition
+
+        # Does this transition leave the current state?
+        if sources is not None and phase not in sources:
+            continue
+
+        # Is its guard satisfied?
+        if not guard():
+            continue
+
+        # Select the transition and produce its output.
+        next_phase = phase if target is None else target
+        reason = reason.format(source=phase, target=next_phase)
+
+        if with_effect:
+            return result, reason, execute
+
+        return result, reason
+
+    raise RuntimeError("Automaton has no matching transition")
+
 # def rule_based_ack(cmd, params, state):
 #     """
 #     ACK decision using the learned finite-state automaton.
