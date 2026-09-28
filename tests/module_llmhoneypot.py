@@ -397,7 +397,7 @@ class LLMHoneypot:
 
 
             # ///////////// Apply queued telemetry “command impact” inside
-
+            self.update_touchdown_state() #new
             with self.stream_lock:
                 items = list(self.streams.items())  # copy
                 # print("[ACTIVE STREAMS]", list(self.streams.keys()), flush=True) # new///
@@ -708,15 +708,65 @@ class LLMHoneypot:
 
             print("[QGC STATE] EXTENDED_SYS_STATE=TAKEOFF", flush=True)
 
+        #     def mark_in_air():
+                
+        #         #new
+        #         with self.state_lock:
+        #             if self.state.landed_state != mavutil.mavlink.MAV_LANDED_STATE_TAKEOFF:
+        #                 return
+        #         #new
+
+        #         with self.state_lock:
+        #             self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
+        #             self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+
+        #             if getattr(self.state, "gpi_relative_alt", 0) <= 0:
+        #                 self.state.gpi_relative_alt = int(target_alt_m * 1000)
+        #             if getattr(self.state, "vfr_alt", 0.0) <= 0:
+        #                 self.state.vfr_alt = float(target_alt_m)
+        #             self.state.vfr_climb = 0.0
+
+        #         print("[QGC STATE] EXTENDED_SYS_STATE=IN_AIR", flush=True)
+
+        #     threading.Timer(3.0, mark_in_air).start()
+        #     return
+
+        # if cmd == LAND:
+        #     with self.state_lock:
+        #         self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_LANDING
+        #         self.state.vtol_state = mavutil.mavlink.MAV_VTOL_STATE_UNDEFINED
+        #         self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+        #         self.state.vfr_climb = -1.0
+
+        #     print("[QGC STATE] EXTENDED_SYS_STATE=LANDING", flush=True)
+
+        #     def mark_on_ground():
+        #         with self.state_lock:
+        #             self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
+        #             self.state.gpi_relative_alt = 0
+        #             self.state.vfr_alt = 0.0
+        #             self.state.vfr_climb = 0.0
+        #             self.state.vfr_groundspeed = 0.0
+
+        #         print("[QGC STATE] EXTENDED_SYS_STATE=ON_GROUND", flush=True)
+
+        #     # threading.Timer(3.0, mark_on_ground).start()
+        #     return
+
             def mark_in_air():
                 with self.state_lock:
+                    if self.state.landed_state != mavutil.mavlink.MAV_LANDED_STATE_TAKEOFF:
+                        return
+
                     self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
                     self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
 
                     if getattr(self.state, "gpi_relative_alt", 0) <= 0:
                         self.state.gpi_relative_alt = int(target_alt_m * 1000)
+
                     if getattr(self.state, "vfr_alt", 0.0) <= 0:
                         self.state.vfr_alt = float(target_alt_m)
+
                     self.state.vfr_climb = 0.0
 
                 print("[QGC STATE] EXTENDED_SYS_STATE=IN_AIR", flush=True)
@@ -732,18 +782,6 @@ class LLMHoneypot:
                 self.state.vfr_climb = -1.0
 
             print("[QGC STATE] EXTENDED_SYS_STATE=LANDING", flush=True)
-
-            def mark_on_ground():
-                with self.state_lock:
-                    self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
-                    self.state.gpi_relative_alt = 0
-                    self.state.vfr_alt = 0.0
-                    self.state.vfr_climb = 0.0
-                    self.state.vfr_groundspeed = 0.0
-
-                print("[QGC STATE] EXTENDED_SYS_STATE=ON_GROUND", flush=True)
-
-            threading.Timer(3.0, mark_on_ground).start()
             return
 
         if cmd in {WAYPOINT, REPOSITION, RTL}:
@@ -758,6 +796,35 @@ class LLMHoneypot:
 
             print("[QGC STATE] EXTENDED_SYS_STATE=IN_AIR for guided/mission command", flush=True)
             return
+
+    def update_touchdown_state(self): #new end-state.land
+        """Update the simulated ground flag without automatically disarming."""
+        mav = mavutil.mavlink
+
+        with self.state_lock:
+            if self.state.landed_state not in (
+                mav.MAV_LANDED_STATE_IN_AIR,
+                mav.MAV_LANDED_STATE_LANDING,
+            ):
+                return
+
+            try:
+                alt_mm = float(self.state.gpi_relative_alt)
+                vz = float(self.state.gpi_vz)
+            except (AttributeError, TypeError, ValueError):
+                return
+
+            # Within 5 cm of ground, descending or stationary.
+            # gpi_vz is positive downward.
+            if (
+                math.isfinite(alt_mm)
+                and math.isfinite(vz)
+                and alt_mm <= 50.0
+                and vz >= 0.0
+            ):
+                self.state.landed_state = mav.MAV_LANDED_STATE_ON_GROUND
+                print("[QGC STATE] Touchdown -> ON_GROUND", flush=True)
+
 
     # def llm_prompt(self, attacker_msg: Optional[dict] = None) -> Optional[dict]:
     def llm_prompt(self, attacker_msg=None, context_type="general"):
