@@ -1057,7 +1057,8 @@ def rule_based_ack(cmd, params, state, *, with_effect=False):
                 "already disarmed; no new action", False
             ),
             (
-                (AG,), lambda: alt < 0.2,
+                # (AG,), lambda: alt < 0.2, 
+                (AG,), lambda: alt <= 0.013,  # old: alt < 0.2
                 DG, ACCEPT,
                 "{source} -> {target}", True
             ),
@@ -1091,12 +1092,14 @@ def rule_based_ack(cmd, params, state, *, with_effect=False):
                 "takeoff already in progress", False
             ),
             (
-                (AG,), lambda: alt < 0.3 and target_alt <= 0.5,
+                # (AG,), lambda: alt < 0.3 and target_alt <= 0.5,
+                 (AG,), lambda: alt <= 0.016 and target_alt <= 0.448,  # old: alt < 0.3 and target_alt <= 0.5
                 None, ACCEPT,
                 "low takeoff target acknowledged; no flight", False
             ),
             (
-                (AG,), lambda: alt < 0.3,
+                # (AG,), lambda: alt < 0.3,
+                (AG,), lambda: alt <= 0.016,  # old: alt < 0.3
                 TO, ACCEPT,
                 "{source} -> {target}", True
             ),
@@ -1134,7 +1137,8 @@ def rule_based_ack(cmd, params, state, *, with_effect=False):
                 "{source}: RTL acknowledged; no flight", False
             ),
             (
-                (TO, FL), lambda: alt > 0.5,
+                # (TO, FL), lambda: alt > 0.5,
+                (TO, FL), lambda: alt >= 1.465,  # old: alt > 0.5
                 FL, ACCEPT,
                 "{source} -> RTL", True
             ),
