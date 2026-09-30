@@ -1,0 +1,1876 @@
+import socket
+import time
+import threading
+import json
+import os, math
+import requests
+from collections import deque
+from typing import Dict, Any, Optional
+from pymavlink import mavutil
+from module_historybuffer_commonstate import CommonState, HistoryBuffer
+from module_cloud_models import call_ollama, call_ollama_cloud, call_gemini_cloud
+from module_helper_functions import (
+    load_command_rag_jsonl,
+    ACK_RESULT_MAP,
+    update_time_fields,
+    make_heartbeat,
+    extract_json,
+    TELEM_BUILDERS,
+    # retrieve_heartbeat_examples_from_sequences,retrieve_telemetry_examples_from_cmd_transition, retrieve_telemetry_examples_from_sequences, rag_retrieve_examples,
+    canonicalize_internal_history_fields,
+    translate_canonical_series_to_internal,
+    TELEM_GROUPS,
+    TELEM_GROUPS_SET,
+    rule_based_ack,
+)
+from module_mission import *
+from module_log import log_mission_llm_csv
+
+from module_rag import (
+    retrieve_heartbeat_examples_from_sequences,
+    retrieve_telemetry_examples_from_cmd_transition,
+    retrieve_telemetry_examples_from_sequences,
+)
+from module_communication import UDPConnection
+# from module_rag import attach_rag_to_hp, retrieve_best_examples_split_from_hp
+class LLMHoneypot:
+
+    # ---------------------------
+    # __init__  (GCS socket setup)
+    # ---------------------------
+    def __init__(self, listen_ip="0.0.0.0", listen_port=14550):
+
+        # self.listen_ip = listen_ip
+        # self.listen_port = listen_port
+        # UDP socket setup  ← from your code
+        # self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # self.sock.bind(("127.0.0.1", 14551)) # for qgc new
+        # self.gcs_addr = ("127.0.0.1", 14550) #for qgc new
+        # self.sock.settimeout(0.2)
+
+        #replaced
+        self.connection = UDPConnection(listen_ip="127.0.0.1",listen_port=14551,gcs_ip="127.0.0.1",gcs_port=14550,timeout=0.2,)
+
+        # MAVLink encoder/decoder # replaced new
+        # self.mav_out = mavutil.mavlink.MAVLink(None)
+        # self.mav_out.srcSystem = 1
+        # self.mav_out.srcComponent = 1
+        # self.mav_in = mavutil.mavlink.MAVLink(None)
+
+        # temporary compatibility alias #new
+        self.mav_out = self.connection.mav_out #new
+
+
+        #self.gcs_addr = None  //for qgc
+        self.state = CommonState()
+        self.boot_time = time.monotonic()
+
+        # print(f"[INIT] Listening on {self.listen_ip}:{self.listen_port}")
+
+        self.llm_enabled = True
+        self.llm_log = []
+        self.state_lock = threading.Lock()
+        self.identity_locked = False
+
+
+        # /////// telemetry helpers ///////
+        self.stream_lock = threading.Lock()
+        self.streams = {}  # name -> [rate_hz, next_send]
+        # heartbeat is handled by heartbeat_loop, so don't add it here
+
+        self.telemetry_stop = threading.Event()
+        self.telemetry_thread = threading.Thread(target=self.telemetry_loop, daemon=True)
+
+        # //////// command helpers ///////
+        # --- history buffers ---
+        self.hist = HistoryBuffer(max_hb=10, max_telem=10, max_cmd=10)
+
+        # --- command rag (mounted file path from your upload) ---
+        # self.cmd_trace_rows = load_command_rag_jsonl("../out/px4_command_trace.jsonl")
+        self.cmd_seq_rows   = load_command_rag_jsonl("./out/px4_command_sequences.jsonl")
+
+        # --- telemetry override queue (10-step series after a command) ---
+        self.override_lock = threading.Lock()
+        self.override_series = deque()  # each item: {"apply_at": float_monotonic, "fields": {...}}
+
+        # telem patch | trigger when 5 left
+        self.regen_in_progress = False
+
+
+        # ////////// for QGC
+        self.params = [
+            ("SYS_AUTOSTART", 4010.0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+            ("COM_ARM_WO_GPS", 0.0,   mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+            ("MPC_XY_VEL_MAX", 5.0,   mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+            ("MIS_TAKEOFF_ALT", 10.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+            ("RTL_RETURN_ALT", 15.0,  mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+        ]
+        self.param_index = {name: i for i, (name, _, _) in enumerate(self.params)}
+        # ////////// for QGC
+
+
+        self.cmd_transition_rows = load_command_rag_jsonl("./out/cmd_transition.jsonl") #
+        # self.cmd_transition_rows = load_command_rag_jsonl("../out/check.jsonl") #temporary
+
+
+        # ---- CONTINUATION STATE ---- # new 2 --telemety patch 
+        self.active_cmd = None
+        self.active_params = None
+
+        self.no_continuation_cmds = {512, 521} #cmd ignore
+
+        # the - mission
+        init_mission_state(self)
+
+        # mission logging
+        self.mission_run_id = time.strftime("mission_%Y%m%d_%H%M%S")
+        self.mission_name = "qgc_uploaded_mission"
+
+
+        # --- new telemetry-state-aware RAG rows --- || RAG
+        # attach_rag_to_hp(self,transition_path="../out/cmd_transition.jsonl",sequence_path="../out/px4_command_sequences.jsonl")
+
+        self.direct_cmd = self.direct_params = None #continous telem | jul 2026 #new
+        self.home = None # for raw rtl #new
+
+        self.cmd_token = 0 #threading commands so new cmd can interrupt -- new new command override
+
+    def start_cmd(self, cmd, params): #threading commands so new cmd can interrupt -- new command override
+        self.cmd_token += 1
+        with self.override_lock:
+            self.override_series.clear()
+
+        threading.Thread(
+            target=lambda: (
+                self.handle_command_heartbeat(cmd, params),
+                cmd != 400 and self.handle_command_telemetry(cmd, params)
+            ),
+            daemon=True
+        ).start() #threading commands so new cmd can interrupt -- new
+
+    # to translate the commands # example: name : MAV_CMD_COMPONENT_ARM_DISARM -- giving enums to the model
+    def get_command_name(self, command_id: int) -> str:
+        """
+        Convert MAVLink command id to enum name, e.g. 400 -> MAV_CMD_COMPONENT_ARM_DISARM
+        """
+        try:
+            enum_entry = mavutil.mavlink.enums["MAV_CMD"].get(int(command_id))
+            if enum_entry is not None:
+                return str(enum_entry.name)
+        except Exception:
+            pass
+        return f"UNKNOWN_MAV_CMD_{int(command_id)}"
+
+    # //////// command helpers ///////
+
+    def log_llm_io(self, tag: str, system_text: str, user_text: str, raw: str, parsed: dict, latency_ms: float):
+        row = {
+            "ts": time.time(),
+            "tag": tag,                    # e.g., "startup_identity", "command"
+            "latency_ms": latency_ms,
+            "system_text": system_text,    # optional (can be huge)
+            "user_text": user_text,        # optional (can be huge)
+            "raw": raw,
+            # "parsed": parsed,
+        }
+        try:
+            # with open("llm_io_log.jsonl", "a") as f:
+            with open("logs/llm_io_log.jsonl", "a") as f:
+                f.write(json.dumps(row) + "\n")
+        except Exception as e:
+            print(f"[LLM LOG ERROR] {e}", flush=True)
+
+    # ---------------------------
+    # send_mav()  (GCS TX)
+    # ---------------------------
+    # def send_mav(self, msg):
+    #     if not self.gcs_addr:
+    #         return
+    #     pkt = msg.pack(self.mav_out)
+    #     self.sock.sendto(pkt, self.gcs_addr)
+    #     # print(f"[SEND_MAV] dst={self.gcs_addr} bytes={len(pkt)}", flush=True)
+
+    # def send_mav(self, msg): #replaced new
+    #     pkt = msg.pack(self.mav_out)
+    #     self.connection.send(pkt)
+
+    def send_mav(self, msg): #new
+        self.connection.send_mav(msg)
+
+    # ///////////////HEARTBEAT /////////////////////////
+
+    def heartbeat_loop(self):
+        while True:
+            # if self.gcs_addr: #new replaced
+            if self.connection.gcs_addr: #new
+                update_time_fields(self.state, self.boot_time)               
+    #  to make llm give heartbeat all the time | uncomment below ////////////////////////
+                # response = self.llm_prompt({"event": "heartbeat_tick"},context_type="heartbeat")
+                # if response and self.verify_response(response):
+                #     self.llm_output_process(response)
+    #  to make llm give heartbeat all the time ////////////////////////
+                # log last heartbeat snapshot (for LLM prompt)               
+                hb = make_heartbeat(self.mav_out, self.state)
+                # print(
+                #     "[HEARTBEAT TX]", "base_mode=", int(self.state.base_mode),
+                #     "custom_mode=", int(self.state.custom_mode), "system_status=", int(self.state.system_status),
+                #     "armed=", bool(self.state.base_mode & 0x80),flush=True) # debug delete later dlt
+
+                self.send_mav(hb)
+                with self.state_lock: # log last 10 hb
+                    self.hist.add_hb(self.state) # log last hb (for LLM prompt)
+            time.sleep(1)
+
+
+    def initialize_heartbeat_identity(self):
+        """
+        Call LLM once to initialize heartbeat identity.
+        """
+
+        response = self.llm_prompt({"event": "startup_identity"})
+
+        if response and self.verify_response(response):
+
+            with self.state_lock:
+                for k, v in response["state_patch"].items():
+                    setattr(self.state, k, v)
+
+            print("[HEARTBEAT] Identity initialized by LLM")
+
+            self.identity_locked = True
+            print("[HEARTBEAT] Identity initialized safely")
+            print(
+                "[DEBUG] Initial HB State:",
+                self.state.hb_type,
+                self.state.hb_autopilot,
+                self.state.base_mode,
+                self.state.custom_mode,
+                self.state.system_status,
+            )
+
+    # ////////////////////// telemetry ///////////////////////
+
+    def _msg_name_from_id(self, msg_id: int) -> str:
+        """
+        Best-effort msg_id -> message name (e.g., 1 -> SYS_STATUS).
+        Works across pymavlink variants.
+        """
+        try:
+            cls = mavutil.mavlink.mavlink_map.get(int(msg_id))
+            if cls is None:
+                return ""
+            # Many builds provide .msgname
+            name = getattr(cls, "msgname", "")
+            if name:
+                return str(name)
+            # Fallback: class name like MAVLink_sys_status_message
+            cname = getattr(cls, "__name__", "")
+            if cname.startswith("MAVLink_") and cname.endswith("_message"):
+                return cname[len("MAVLink_"):-len("_message")].upper()
+            return cname.upper()
+        except Exception:
+            return ""
+
+
+    def _apply_message_interval_request(self, msg_id: int, interval_us: int) -> bool:
+        """
+        Returns True if handled, False if unsupported/unknown.
+        """
+        # Normalize (COMMAND_LONG params often come in as floats)
+        try:
+            msg_id_i = int(round(float(msg_id)))
+            interval_us_i = int(round(float(interval_us)))
+        except Exception as e:
+            print(f"[STREAM] invalid params msg_id={msg_id!r} interval_us={interval_us!r} err={e}", flush=True)
+            return False
+
+        name = self._msg_name_from_id(msg_id_i)
+        if not name:
+            print(f"[STREAM] unknown msg_id={msg_id_i} interval_us={interval_us_i}", flush=True)
+            return False
+
+        # HEARTBEAT handled elsewhere
+        if name == "HEARTBEAT":
+            print(f"[STREAM] ignoring HEARTBEAT request interval_us={interval_us_i}", flush=True)
+            return True
+
+        # Only stream what we can build
+        if name not in TELEM_BUILDERS:
+            print(f"[STREAM] not supported {name} (msg_id={msg_id_i})", flush=True)
+            return False
+
+        # disable stream
+        if interval_us_i <= 0:
+            with self.stream_lock:
+                self.streams.pop(name, None)
+            print(f"[STREAM] disabled {name}", flush=True)
+            return True
+
+        rate_hz = 1e6 / float(interval_us_i)
+        rate_hz = max(0.1, min(rate_hz, 50.0))
+
+        now = time.monotonic()
+        with self.stream_lock:
+            self.streams[name] = [rate_hz, now]
+
+        print(f"[STREAM] enabled {name} (msg_id={msg_id_i}) @ {rate_hz:.2f} Hz", flush=True)
+        return True
+
+
+
+    def telemetry_loop(self):
+        """
+        Sends telemetry ONLY for streams requested via SET_MESSAGE_INTERVAL.
+        HEARTBEAT is not handled here.
+        """
+        tick = 0.01  # internal scheduler rate (100 Hz)
+
+        while not self.telemetry_stop.is_set():
+            # if not self.gcs_addr: #new replaced
+            if not self.connection.gcs_addr: #new
+                time.sleep(tick)
+                continue
+
+            now = time.monotonic()
+
+            with self.state_lock:
+                update_time_fields(self.state, self.boot_time)
+
+
+
+            # ///////////// Apply queued telemetry “command impact” inside
+            # --- apply scheduled command-impact telemetry steps (if any) ---
+            with self.override_lock:
+                while self.override_series and now >= self.override_series[0]["apply_at"]:
+                    step = self.override_series.popleft()
+                    fields = step.get("fields", {})
+                    with self.state_lock:
+                        for k, v in fields.items():
+                            if hasattr(self.state, k):
+                                setattr(self.state, k, v)
+
+            # ///////////// Apply queued telemetry “command impact” inside
+            self.update_touchdown_state() #new
+            with self.stream_lock:
+                items = list(self.streams.items())  # copy
+                # print("[ACTIVE STREAMS]", list(self.streams.keys()), flush=True) # new///
+
+            for name, (rate_hz, next_send) in items:
+                if now < next_send:
+                    continue
+
+                builder = TELEM_BUILDERS.get(name)
+                if not builder:
+                    continue
+
+                try:
+                    with self.state_lock:
+                        msg = builder(self.mav_out, self.state)
+                    self.send_mav(msg)
+                    # print(f"[TELEM TX] {name}", flush=True) # new///
+                except Exception as e:
+                    print(f"[TELEM ERROR] {name}: {e}", flush=True)
+                    continue
+
+                # ///// new part
+                # log telemetry snapshot AFTER successful send
+                with self.state_lock:
+                    if name == "SYS_STATUS":
+                        self.hist.add_telem(name, {
+                            "battery_remaining": self.state.battery_remaining,
+                            "voltage_battery": self.state.voltage_battery,
+                            "load": self.state.load,
+                        })
+
+                    elif name == "GPS_RAW_INT":
+                        self.hist.add_telem(name, {
+                            "gps_fix_type": self.state.gps_fix_type,
+                        })
+
+                    elif name == "GLOBAL_POSITION_INT":
+                        self.hist.add_telem(name, {
+                            "gpi_lat": self.state.gpi_lat,
+                            "gpi_lon": self.state.gpi_lon,
+                            "gpi_alt": self.state.gpi_alt,
+                            "gpi_relative_alt": self.state.gpi_relative_alt,
+                            "gpi_vx": self.state.gpi_vx,
+                            "gpi_vy": self.state.gpi_vy,
+                            "gpi_vz": self.state.gpi_vz,
+                            "gpi_hdg": self.state.gpi_hdg,
+                        })
+
+                    elif name == "ATTITUDE":
+                        self.hist.add_telem(name, {
+                            "roll": self.state.roll,
+                            "pitch": self.state.pitch,
+                            "yaw": self.state.yaw,
+                        })
+
+                    elif name == "VFR_HUD":
+                        self.hist.add_telem(name, {
+                            "vfr_groundspeed": self.state.vfr_groundspeed,
+                            "vfr_heading": self.state.vfr_heading,
+                            "vfr_throttle": self.state.vfr_throttle,
+                            "vfr_alt": self.state.vfr_alt,
+                            "vfr_climb": self.state.vfr_climb,
+                        })
+                # /////////////// telemetry logging /////
+
+                period = 1.0 / max(0.0001, float(rate_hz))
+                with self.stream_lock:
+                    # stream may have been removed meanwhile
+                    if name in self.streams:
+                        self.streams[name][1] = now + period
+
+            time.sleep(tick)
+
+            # ////////////////////// telemetry ///////////////////////
+
+    # send telemetry helpers # new///
+    def enable_default_telem_streams(self):
+        now = time.monotonic()
+        with self.stream_lock:
+
+            self.streams["SYS_STATUS"] = [2.0, now]
+            self.streams["GPS_RAW_INT"] = [2.0, now]
+            self.streams["GLOBAL_POSITION_INT"] = [2.0, now]
+            self.streams["ATTITUDE"] = [2.0, now]
+            self.streams["VFR_HUD"] = [2.0, now]
+            self.streams["BATTERY_STATUS"] = [2.0, now] #new
+            self.streams["MISSION_CURRENT"] = [2.0, now] # current mission # new
+
+            # QGC flying/landing state
+            self.streams["EXTENDED_SYS_STATE"] = [1.0, now] # new jul
+
+        print("[DEFAULT STREAMS ENABLED]", list(self.streams.keys()), flush=True)
+
+
+    # //////////////////////QGC ///////////////////////
+    def _send_param_value(self, name: str, value: float, ptype: int, index: int, count: int):
+        name16 = name[:16]  # MAVLink param_id is 16 chars
+        msg = self.mav_out.param_value_encode(
+            name16.encode("ascii"),
+            float(value),
+            int(ptype),
+            int(count),
+            int(index),
+        )
+        self.send_mav(msg)
+
+    def _send_all_params(self):
+        count = len(self.params)
+        for i, (name, val, ptype) in enumerate(self.params):
+            self._send_param_value(name, val, ptype, i, count)
+    # //////////////////////QGC ///////////////////////
+
+
+    # ---------------------------
+    # core()  (Main loop)
+    # ---------------------------
+
+    OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://192.168.1.100:11434")
+    OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b")
+    OLLAMA_TIMEOUT_SEC = 90
+
+
+    LLM_OUTPUT_RULES = """
+    Return ONLY valid JSON in this exact shape:
+    {
+    "verdict": {"label": "benign|suspicious|attack", "reason": "short"},
+    "state_patch": { "<CommonState field>": <value>, ... },
+    "telemetry_series": [
+        {"dt": 0.5, "fields": {"<CommonState field>": <value>, ...}},
+        {"dt": 1.0, "fields": {...}},
+        ...
+    ]
+    }
+
+    Rules:
+    - telemetry_series covers ~1-3 seconds, dt is non-decreasing.
+    - Only use fields that exist in CommonState.aa
+    - Keep values plausible.
+    Units (MUST follow):
+    - gps_lat, gps_lon, gpi_lat, gpi_lon: integer in range -900000000 to 900000000
+    - gps_alt, gpi_alt, gpi_relative_alt: int millimeters
+    - gps_vel: int cm/s
+    - gps_cog, gpi_hdg: int centi-degrees (0..35999)
+    - roll, pitch, yaw: radians
+    """
+
+    def apply_qgc_flight_state_from_cmd(self, cmd: int, params: dict): # new jul
+        """
+        Rule-based QGC state update.
+        EXTENDED_SYS_STATE is transmitted continuously by telemetry_loop.
+        This function only changes the current state value.
+        """
+
+        ARM_DISARM = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+        TAKEOFF = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+        LAND = mavutil.mavlink.MAV_CMD_NAV_LAND
+        WAYPOINT = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
+        RTL = mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH
+        REPOSITION = getattr(mavutil.mavlink, "MAV_CMD_DO_REPOSITION", 192)
+
+        if cmd == ARM_DISARM:
+            arm = int(round(float(params.get("param1", 0.0)))) == 1
+
+            with self.state_lock:
+                if arm:
+                    self.state.base_mode |= mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                    self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+                    self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
+                else:
+                    self.state.base_mode &= ~mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                    self.state.system_status = mavutil.mavlink.MAV_STATE_STANDBY
+                    self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND
+                    self.state.gpi_relative_alt = 0
+                    self.state.vfr_alt = 0.0
+                    self.state.vfr_climb = 0.0
+
+            print(f"[QGC STATE] ARM={arm} landed_state={self.state.landed_state}", flush=True)
+            return
+
+        if cmd == TAKEOFF:
+            target_alt_m = float(params.get("param7", 10.0))
+            if target_alt_m <= 0:
+                target_alt_m = 10.0
+
+            with self.state_lock:
+                self.state.base_mode |= mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+                self.state.vtol_state = mavutil.mavlink.MAV_VTOL_STATE_UNDEFINED
+                self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_TAKEOFF
+
+                if getattr(self.state, "gpi_relative_alt", 0) <= 0:
+                    self.state.gpi_relative_alt = 1000
+                if getattr(self.state, "vfr_alt", 0.0) <= 0:
+                    self.state.vfr_alt = 1.0
+                if getattr(self.state, "vfr_climb", 0.0) <= 0:
+                    self.state.vfr_climb = 1.0
+
+            print("[QGC STATE] EXTENDED_SYS_STATE=TAKEOFF", flush=True)
+
+            def mark_in_air():
+                with self.state_lock:
+                    if self.state.landed_state != mavutil.mavlink.MAV_LANDED_STATE_TAKEOFF:
+                        return
+
+                    self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
+                    self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+
+                    if getattr(self.state, "gpi_relative_alt", 0) <= 0:
+                        self.state.gpi_relative_alt = int(target_alt_m * 1000)
+
+                    if getattr(self.state, "vfr_alt", 0.0) <= 0:
+                        self.state.vfr_alt = float(target_alt_m)
+
+                    self.state.vfr_climb = 0.0
+
+                print("[QGC STATE] EXTENDED_SYS_STATE=IN_AIR", flush=True)
+
+            threading.Timer(3.0, mark_in_air).start()
+            return
+
+        if cmd == LAND:
+            with self.state_lock:
+                self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_LANDING
+                self.state.vtol_state = mavutil.mavlink.MAV_VTOL_STATE_UNDEFINED
+                self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+                self.state.vfr_climb = -1.0
+
+            print("[QGC STATE] EXTENDED_SYS_STATE=LANDING", flush=True)
+            return
+
+        if cmd in {WAYPOINT, REPOSITION, RTL}:
+            with self.state_lock:
+                self.state.landed_state = mavutil.mavlink.MAV_LANDED_STATE_IN_AIR
+                self.state.system_status = mavutil.mavlink.MAV_STATE_ACTIVE
+
+                if getattr(self.state, "gpi_relative_alt", 0) <= 0:
+                    self.state.gpi_relative_alt = 10000
+                if getattr(self.state, "vfr_alt", 0.0) <= 0:
+                    self.state.vfr_alt = 10.0
+
+            print("[QGC STATE] EXTENDED_SYS_STATE=IN_AIR for guided/mission command", flush=True)
+            return
+
+    def update_touchdown_state(self): #new end-state.land
+        """Update the simulated ground flag without automatically disarming."""
+        mav = mavutil.mavlink
+
+        with self.state_lock:
+            if self.state.landed_state not in (
+                mav.MAV_LANDED_STATE_IN_AIR,
+                mav.MAV_LANDED_STATE_LANDING,
+            ):
+                return
+
+            try:
+                alt_mm = float(self.state.gpi_relative_alt)
+                vz = float(self.state.gpi_vz)
+            except (AttributeError, TypeError, ValueError):
+                return
+
+            # Within 5 cm of ground, descending or stationary.
+            # gpi_vz is positive downward.
+            if (
+                math.isfinite(alt_mm)
+                and math.isfinite(vz)
+                and alt_mm <= 50.0
+                and vz >= 0.0
+            ):
+                self.state.landed_state = mav.MAV_LANDED_STATE_ON_GROUND
+                print("[QGC STATE] Touchdown -> ON_GROUND", flush=True)
+
+
+    # def llm_prompt(self, attacker_msg: Optional[dict] = None) -> Optional[dict]:
+    def llm_prompt(self, attacker_msg=None, context_type="general"):
+        """
+        Build prompt + call Ollama + extract JSON.
+        Returns parsed dict or None.
+        """
+
+        HEARTBEAT_PROMPT_PATCH = """
+        Context: You are generating HEARTBEAT state updates.
+
+        Rules:
+        - Only modify: base_mode, custom_mode, system_status.
+        - Do NOT modify: hb_type, hb_autopilot, mavlink_version.
+        - Maintain identity consistency.
+        - Armed flag is base_mode bit 7.
+        - system_status must be realistic (e.g., STANDBY=3, ACTIVE=4).
+        - Do not generate large sudden changes.
+        """
+
+
+        # -------------------------
+        # 1️⃣ Snapshot state safely
+        # -------------------------
+        with self.state_lock:
+            snapshot = self.state.__dict__.copy()
+
+        # /////////////////// HEARTBEAT /////////////////////////
+        if context_type == "heartbeat":
+            system_text = self.LLM_OUTPUT_RULES + "\n" + HEARTBEAT_PROMPT_PATCH
+        else:
+            system_text = self.LLM_OUTPUT_RULES
+        # /////////////////// HEARTBEAT /////////////////////////
+        
+
+        user_text = json.dumps({
+            "current_state": snapshot,
+            "attacker_input": attacker_msg,
+            "instruction": "Evaluate situation and respond per output rules."
+        })
+
+        try:
+            # -------------------------
+            # 2 Call model
+            # -------------------------
+
+            raw = call_ollama(self, system_text, user_text)
+
+            # -------------------------
+            # 3 Extract JSON
+            # -------------------------
+            parsed = extract_json(raw)
+
+            if parsed is None:
+                print("[LLM] JSON extraction failed")
+                return None
+
+            return parsed
+
+        except Exception as e:
+            print(f"[LLM ERROR] {e}")
+            return None
+
+
+
+
+    def verify_response(self, response: dict) -> bool:
+
+        if not isinstance(response, dict):
+            return False
+
+        required = {"verdict", "state_patch", "telemetry_series"}
+        if not required.issubset(response.keys()):
+            print("[VERIFY FAIL] Missing required keys")
+            return False
+
+        valid_fields = set(self.state.__dict__.keys())
+
+        # Validate state_patch
+        state_patch = response.get("state_patch", {})
+        if not isinstance(state_patch, dict):
+            return False
+
+        for k in state_patch.keys():
+            if k not in valid_fields:
+                print(f"[VERIFY FAIL] Invalid state field: {k}")
+                return False
+
+        # Validate telemetry_series
+        series = response.get("telemetry_series", [])
+        if not isinstance(series, list):
+            return False
+
+        last_dt = -1
+        for step in series:
+            if "dt" not in step or "fields" not in step:
+                print("[VERIFY FAIL] Bad telemetry structure")
+                return False
+
+            if step["dt"] < last_dt:
+                print("[VERIFY FAIL] dt not non-decreasing")
+                return False
+
+            last_dt = step["dt"]
+
+            for k in step["fields"].keys():
+                if k not in valid_fields:
+                    print(f"[VERIFY FAIL] Invalid telemetry field: {k}")
+                    return False
+        # ///////////////////////HEARTBEAT /////////////////////////
+        if self.identity_locked:
+            protected = {"hb_type", "hb_autopilot", "mavlink_version"}
+            for k in state_patch.keys():
+                if k in protected:
+                    print(f"[VERIFY FAIL] Attempt to modify locked identity field: {k}")
+                    return False
+        # ///////////////////////HEARTBEAT /////////////////////////
+        return True
+
+
+    def llm_output_process(self, response: dict):
+
+        if not self.verify_response(response):
+            print("[LLM] Response rejected.")
+            return
+
+        with self.state_lock:
+            # Apply immediate state patch
+            for k, v in response["state_patch"].items():
+                setattr(self.state, k, v)
+
+        print("[LLM] State patch applied.")
+
+
+
+    def llm_logging(self, attacker_msg: dict, response: dict):
+
+        entry = {
+            "timestamp": time.time(),
+            "attacker_input": attacker_msg,
+            "verdict": response.get("verdict"),
+            "state_patch": response.get("state_patch"),
+            "telemetry_steps": len(response.get("telemetry_series", []))
+        }
+
+        self.llm_log.append(entry)
+
+        try:
+            with open("llm_decision_log.jsonl", "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as e:
+            print(f"[LOG ERROR] {e}")
+
+
+
+    # ////////////handle commands////////////////////////
+    # logging the command and response
+    def log_cmd_vs_llm(self, cmd: int, params: dict, llm_raw: str, llm_parsed: dict):
+        row = {
+            "ts": time.time(),
+            "cmd": int(cmd),
+            "params": params,
+            "llm_raw": llm_raw,
+            "llm_parsed": llm_parsed,
+        }
+        try:
+            with open("./logs/cmd_llm_log.jsonl", "a") as f:
+                f.write(json.dumps(row) + "\n")
+            print("[LOG] log_cmd_vs_llm CALLED", flush=True)
+            print("[LOG] path=./logs/cmd_llm_log.jsonl", flush=True)
+        except Exception as e:
+            print(f"[CMD_LLM_LOG_ERROR] {e}", flush=True)
+
+
+    def apply_llm_command_result(self, response: dict) -> None:
+        """
+        1) Send COMMAND_ACK
+        2) Apply heartbeat_patch + state_patch immediately
+        3) Schedule telemetry_series over next 1 second (10 steps)
+        """
+        if not isinstance(response, dict):
+            return
+
+        ack = response.get("ack", {})
+        cmd_id = int(ack.get("command", -1)) if isinstance(ack, dict) else -1
+        result_str = (ack.get("result") if isinstance(ack, dict) else "UNSUPPORTED") or "UNSUPPORTED"
+        result_str = str(result_str).upper().strip()
+        mav_result = ACK_RESULT_MAP.get(result_str, mavutil.mavlink.MAV_RESULT_UNSUPPORTED)
+
+        # //// commented out for ack time delay /////
+        # if cmd_id >= 0:
+        #     ack_msg = self.mav_out.command_ack_encode(cmd_id, mav_result)
+        #     self.send_mav(ack_msg)
+        # //// commented out for ack time delay /////
+        
+
+        # apply patches
+        hb_patch = response.get("heartbeat_patch", {}) if isinstance(response.get("heartbeat_patch", {}), dict) else {}
+        state_patch = response.get("state_patch", {}) if isinstance(response.get("state_patch", {}), dict) else {}
+
+        with self.state_lock:
+            for k, v in hb_patch.items():
+                if k in ("base_mode", "custom_mode", "system_status"):
+                    setattr(self.state, k, v)
+            for k, v in state_patch.items():
+                if hasattr(self.state, k):
+                    setattr(self.state, k, v)
+
+        # schedule telemetry series
+        series = response.get("telemetry_series", [])
+        if not isinstance(series, list) or len(series) == 0:
+            return
+
+        base = time.monotonic()
+        with self.override_lock:
+            self.override_series.clear()
+            for step in series:
+                dt = float(step.get("dt", 0.0))
+                fields = step.get("fields", {})
+                if not isinstance(fields, dict):
+                    continue
+                self.override_series.append({
+                    "apply_at": base + dt,
+                    "fields": fields
+                })
+
+        print(f"[CMD APPLY] ack={result_str} scheduled_steps={len(self.override_series)}", flush=True)
+    # for heartbeat based on commands /////////
+    def handle_command_heartbeat(self, command_id: int, params: dict) -> Optional[dict]:
+        """
+        Heartbeat-only LLM handler.
+        Input:
+        - rag traces as example
+        - current command
+        - previous heartbeat only
+        - optional telemetry slot kept commented for later
+        Output:
+        - parsed response dict, or None
+        Side effect:
+        - applies heartbeat patch once if valid
+        """
+        token = self.cmd_token # new cmd can interrupt command override
+        fewshot_seq = retrieve_heartbeat_examples_from_sequences(self.cmd_seq_rows, command_id, k=5)
+        fewshot_trace = []   # keep trace disabled for heartbeat for now
+        # 1) collect only previous heartbeat
+        with self.state_lock:
+            prev_hb = {
+                "hb_type": int(self.state.hb_type),
+                "hb_autopilot": int(self.state.hb_autopilot),
+                "base_mode": int(self.state.base_mode),
+                "custom_mode": int(self.state.custom_mode),
+                "system_status": int(self.state.system_status),
+                "mavlink_version": int(self.state.mavlink_version),
+            }
+
+        # Optional telemetry context for later
+        # last_telem = self.hist.snapshot().get("last_telemetry", [])
+        # last_telem = last_telem[-1] if last_telem else None
+        # cmd_name = self.get_command_name(command_id)
+
+        system_text = """
+        You are a MAVLink heartbeat patch generator for a drone honeypot.
+
+        You are given:
+        - the current command
+        - the current previous heartbeat
+        - a few command-centered heartbeat transition examples from past traces
+
+        Your task:
+        - compare the current command with the examples
+        - start from previous_heartbeat
+        - produce only the immediate next heartbeat patch
+
+        Return ONLY valid JSON in exactly this format:
+        {
+        "heartbeat_patch": {
+            "base_mode": <int>,
+            "custom_mode": <int>,
+            "system_status": <int>
+        },
+        "reason": "<short>"
+        }
+
+        Rules:
+        - Do NOT invent a new heartbeat from scratch.
+        - Start from previous_heartbeat.
+        - Use the fewshot transition examples to infer whether this command changes heartbeat.
+        - If examples do not show a heartbeat-changing effect, preserve previous heartbeat.
+        - Only command 400 may change the armed bit in base_mode.
+        - For commands other than 400, preserve the armed bit exactly.
+        - heartbeat_patch must contain exactly: base_mode, custom_mode, system_status.
+        - Do not output hb_type, hb_autopilot, mavlink_version, or telemetry fields.
+        - Return JSON only.
+        """.strip()
+
+        user_payload = {
+            "command": {
+                "id": int(command_id),
+                # "name": cmd_name,
+                "params": {
+                    "param1": float(params.get("param1", 0.0)),
+                    "param2": float(params.get("param2", 0.0)),
+                    "param3": float(params.get("param3", 0.0)),
+                    "param4": float(params.get("param4", 0.0)),
+                    "param5": float(params.get("param5", 0.0)),
+                    "param6": float(params.get("param6", 0.0)),
+                    "param7": float(params.get("param7", 0.0)),
+                },
+            },
+            "previous_heartbeat": prev_hb,
+            "fewshot": {
+                "sequence_examples": fewshot_seq,
+                "trace_examples": fewshot_trace,
+            },
+            # "previous_telemetry": last_telem,
+            "instruction": "Generate one heartbeat patch for this command."
+        }
+
+        user_text = json.dumps(user_payload)
+
+        try:
+            print("\n[HB LLM USER PROMPT]")
+            print(user_text, flush=True) # view llm prompt
+
+            # raw = self.call_ollama(system_text, user_text, tag="heartbeat_command") #original
+            # raw = self.call_ollama_cloud(system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
+
+            # raw = call_ollama_cloud(self, system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
+            raw = call_ollama(self, system_text, user_text, tag="heartbeat_command") 
+            if token is not None and token != self.cmd_token: #new command override
+                print(f"[OLD TELEM IGNORED] cmd={command_id}", flush=True)
+                return None            
+            parsed = extract_json(raw)
+
+            print("\n[HB LLM RAW RESPONSE]")
+            print(raw, flush=True) # view llm prompt
+
+            if not parsed:
+                print("[HB LLM] JSON parse failed", flush=True)
+                return None
+
+            if not self.validate_heartbeat_patch_response(parsed, prev_hb):
+                print("[HB LLM] heartbeat patch validation failed", flush=True)
+                return None
+
+            patch = parsed.get("heartbeat_patch", {})
+            self.apply_heartbeat_patch(patch)
+
+            print("\n[HB PATCH APPLIED]")
+            print(json.dumps(patch, indent=2), flush=True)
+
+            return parsed
+
+        except Exception as e:
+            print(f"[HB LLM ERROR] {e}", flush=True)
+            return None
+
+    def validate_heartbeat_patch_response(self, response: dict, prev_hb: dict) -> bool:
+        """
+        Validate heartbeat-only LLM response.
+        """
+
+        if not isinstance(response, dict):
+            return False
+
+        if "heartbeat_patch" not in response:
+            print("[HB VERIFY FAIL] missing heartbeat_patch", flush=True)
+            return False
+
+        patch = response.get("heartbeat_patch")
+        if not isinstance(patch, dict):
+            print("[HB VERIFY FAIL] heartbeat_patch is not dict", flush=True)
+            return False
+
+        allowed = {"base_mode", "custom_mode", "system_status"}
+        required = {"base_mode", "custom_mode", "system_status"}
+
+        # Must contain exactly the required fields for this version
+        if set(patch.keys()) != required:
+            print(f"[HB VERIFY FAIL] patch keys must be exactly {required}, got {set(patch.keys())}", flush=True)
+            return False
+
+        for k, v in patch.items():
+            if k not in allowed:
+                print(f"[HB VERIFY FAIL] invalid field: {k}", flush=True)
+                return False
+            if not isinstance(v, int):
+                # allow float that is integer-like
+                if isinstance(v, float) and float(v).is_integer():
+                    patch[k] = int(v)
+                else:
+                    print(f"[HB VERIFY FAIL] non-integer value for {k}: {v}", flush=True)
+                    return False
+
+        # protect identity fields implicitly by not allowing them at all
+        # optional plausibility checks
+        if patch["base_mode"] < 0:
+            print("[HB VERIFY FAIL] base_mode negative", flush=True)
+            return False
+
+        if patch["system_status"] < 0:
+            print("[HB VERIFY FAIL] system_status negative", flush=True)
+            return False
+
+        return True
+
+
+    def apply_heartbeat_patch(self, patch: dict) -> None:
+        """
+        Apply heartbeat-only patch once.
+        """
+
+        if not isinstance(patch, dict):
+            return
+
+        allowed = {"base_mode", "custom_mode", "system_status"}
+
+        with self.state_lock:
+            for k, v in patch.items():
+                if k in allowed:
+                    setattr(self.state, k, int(v))
+
+
+    # for heartbeat based on commands /////////
+
+    # for telemetry based on commands /////////
+    def get_current_heartbeat_snapshot(self) -> dict:
+        with self.state_lock:
+            return {
+                "base_mode": int(self.state.base_mode),
+                "custom_mode": int(self.state.custom_mode),
+                "system_status": int(self.state.system_status),
+            }
+
+
+    # ------ validator 
+
+    def get_last_5_telemetry_snapshots(self) -> list:
+        hist = self.hist.snapshot().get("last_telemetry", [])
+        out = []
+
+        for item in hist[-5:]:
+            if not isinstance(item, dict):
+                continue
+
+            fields = item.get("fields", {})
+            if not isinstance(fields, dict):
+                continue
+
+            grouped = canonicalize_internal_history_fields(fields)
+            if not grouped:
+                continue
+
+            out.append({
+                "name": item.get("name"),
+                "ts": item.get("ts"),
+                "fields": grouped,
+            })
+
+        return out
+        
+    # ----prompting
+    def handle_command_telemetry(self, command_id: int, params: dict) -> Optional[dict]:
+        """
+        Telemetry-only LLM handler.
+        Uses:
+          - current command
+          - current heartbeat
+          - last 5 live telemetry
+          - transition examples from cmd_transition.jsonl
+          - sequence followup examples from px4_command_sequences.jsonl
+        """
+        token = self.cmd_token # new command overrides
+        last_5_telem = self.get_last_5_telemetry_snapshots()
+        current_hb = self.get_current_heartbeat_snapshot()
+
+        transition_examples = retrieve_telemetry_examples_from_cmd_transition(
+            self.cmd_transition_rows, command_id, k=2
+        )
+        sequence_examples = retrieve_telemetry_examples_from_sequences(
+            self.cmd_seq_rows, command_id, k=2
+        )
+
+        # #  || RAG
+        # rag_pack = retrieve_best_examples_split_from_hp(
+        #     self,
+        #     command_id=command_id,
+        #     params=params,
+        #     k_each=1,
+        # )
+
+        # transition_examples = rag_pack["transition_examples"]
+        # sequence_examples = rag_pack["sequence_examples"]
+        # #  || RAG
+
+        print("[--DEBUG--] last_5_telemetry_count =", len(last_5_telem))
+        print("[--DEBUG--] transition_examples =", len(transition_examples))
+        print("[--DEBUG--] sequence_examples =", len(sequence_examples))
+        cmd_name = self.get_command_name(command_id)
+
+        system_text = """
+        You are a MAVLink telemetry predictor for a drone honeypot.
+
+        You are given:
+        - the current command
+        - the current heartbeat
+        - the most recent live telemetry context
+        - transition examples from past traces
+        - short future telemetry examples from past traces
+        - the allowed telemetry schema
+
+        Your task:
+        - generate the next 5 telemetry states after this command
+        - use only canonical MAVLink telemetry names
+        - group telemetry by MAVLink message name
+        - follow the allowed telemetry schema exactly
+        - keep the sequence physically consistent and smooth
+        - preserve continuity from the latest telemetry state
+
+        Return ONLY valid JSON in exactly this format:
+        {
+        "telemetry_series": [
+            {"dt": 0.5, "fields": {}},
+            {"dt": 1.0, "fields": {}},
+            {"dt": 1.5, "fields": {}},
+            {"dt": 2.0, "fields": {}},
+            {"dt": 2.5, "fields": {}}
+        ],
+        "reason": "<short>"
+        }
+
+        Rules:
+        - Only use message groups and fields defined in allowed_telemetry_groups.
+        - Do not use internal or private variable names.
+        - Keep all changes smooth, realistic, and temporally consistent.
+        - The first telemetry state at dt=0.5 must begin from the latest available telemetry state.
+        - Use examples only to learn which fields change and the style of change. Never copy absolute values.
+        - Always include SYS_STATUS.battery_remaining.
+        - If a field does not need to change, keep it unchanged or omit it.
+        - Keep telemetry internally consistent across message groups.
+        - Beware of the altitude
+
+        Command-specific behavior:
+        - ARM/DISARM (400): may change armed-related behavior, but must not simulate takeoff unless a takeoff command is given.
+        - TAKEOFF (22): perform a smooth vertical climb. Horizontal movement should remain minimal. Relative altitude must increase toward the target altitude.
+        - WAYPOINT (16): move smoothly toward target latitude and longitude while maintaining target altitude.
+        - LAND (21): descend smoothly toward ground with minimal horizontal movement.
+        - Return to Launch (20): like WAYPOINT you have to reach to coordinates.
+        
+        For WAYPOINT (16):
+        - Move in a straight line from current position to the target position.
+        - At every step, reduce the distance to the target.
+        - Do not move sideways or away from the direct path.
+        - If any drift occurs, correct the direction back toward the straight path.
+        - Maintain smooth and consistent velocity toward the target.
+
+        Completion requirement:
+        - The generated 5-step sequence must move the drone toward the command target.
+        - If the target is reachable within 5 steps, fully complete it.
+        - If the target is not realistically reachable within 5 steps, make strong, consistent progress toward it without unrealistic jumps.
+        - Do not overshoot and reverse direction within the same 5 steps.
+
+        Consistency requirements:
+        - GLOBAL_POSITION_INT.relative_alt and VFR_HUD.alt must follow the same trend.
+        - If altitude increases, climb should be positive or zero.
+        - If altitude decreases, climb should be negative or zero.
+        - Do not abruptly change direction unless already indicated by current telemetry.
+        - Keep velocity, altitude, and heading changes smooth and consistent.
+
+        Kinematic realism:
+        - First update position: GLOBAL_POSITION_INT.lat/lon/relative_alt and VFR_HUD.alt.
+        - VFR_HUD.alt is meters; GLOBAL_POSITION_INT.relative_alt is millimeters, so relative_alt = VFR_HUD.alt × 1000.
+        - For normal waypoint flight, choose groundspeed around 8–10.
+        - For takeoff/landing, keep horizontal groundspeed low, around 0 m/s.
+        - If groundspeed is 0, lat/lon must not change.
+        - If the waypoint is closer than the allowed movement, slow down and stop at the target.
+        - vx/vy/vz must describe the same movement shown by lat/lon/altitude. Use cm/s integers.
+        - VFR_HUD.heading must point in the same direction as lat/lon movement.
+        - GLOBAL_POSITION_INT.hdg = VFR_HUD.heading × 100.
+        - ATTITUDE.yaw must match heading in radians.
+        - Pitch should be near 0, slightly positive during climb, and slightly negative during descent.
+        - Roll should be near 0 unless the drone is turning.
+        
+        Return JSON only.
+        """.strip()
+        user_payload = {
+            "command": {
+                "id": int(command_id),
+                "name": cmd_name,
+                "params": {
+                    "param1": float(params.get("param1", 0.0)),
+                    "param2": float(params.get("param2", 0.0)),
+                    "param3": float(params.get("param3", 0.0)),
+                    "param4": float(params.get("param4", 0.0)),
+                    "param5": float(params.get("param5", 0.0)),
+                    "param6": float(params.get("param6", 0.0)),
+                    "param7": float(params.get("param7", 0.0)),
+                },
+            },
+            "current_heartbeat": current_hb,
+            "last_5_telemetry": last_5_telem,
+            "transition_examples": transition_examples,
+            "sequence_examples": sequence_examples,
+            "allowed_telemetry_groups": TELEM_GROUPS,
+            "instruction": "Generate the next 5 telemetry states using canonical MAVLink field names grouped by message."
+        }
+
+        user_text = json.dumps(user_payload)
+
+        try:
+            print("\n[TELEM LLM USER PROMPT]")
+            print(user_text, flush=True) # view LLM prompt
+
+            # raw = call_ollama_cloud(self,system_text, user_text, tag="telemetry_command") #uncomment
+            raw = call_ollama(self,system_text, user_text, tag="telemetry_command") #uncomment
+
+
+            if token != self.cmd_token: # new cmd override
+                print(f"[OLD RESPONSE IGNORED] cmd={command_id}", flush=True)
+                return None
+            
+            # # comment use when gemini #
+            # gemini_result = call_gemini_cloud(system_text, user_text, tag="telemetry_command", model_name="gemini-2.5-flash",log_fn=self.log_llm_io, return_meta=True,)
+            # raw = gemini_result["raw"]
+
+            # self.last_llm_latency_ms = gemini_result["latency_ms"]
+            # self.last_llm_model_name = gemini_result["model_name"]
+
+            # parsed = gemini_result["parsed"]
+
+            # parsed = gemini_result.get("parsed")
+
+            # if parsed is None:
+            #     parsed = extract_json(raw)
+            # # comment use when gemini #
+
+            parsed = extract_json(raw)  # if gemini comment this.
+
+            print("\n[TELEM LLM RAW RESPONSE]")
+            print(raw, flush=True)
+
+            if not parsed:
+                print("[TELEM LLM] JSON parse failed", flush=True)
+                return None
+
+            if not self.validate_telemetry_response(parsed):
+                print("[TELEM LLM] validation failed", flush=True)
+                return None
+
+            # series = parsed.get("telemetry_series", [])
+            # base = time.monotonic()
+
+            # with self.override_lock:
+            #     self.override_series.clear()
+            #     for step in series:
+            #         self.override_series.append({
+            #             "apply_at": base + float(step["dt"]),
+            #             "fields": step["fields"],
+            #         })
+
+            log_mission_llm_csv(
+                hp=self,
+                command_id=command_id,
+                command_name=cmd_name,
+                params=params,
+                user_payload=user_payload,
+                parsed=parsed,
+            )
+
+            series = parsed.get("telemetry_series", [])
+            translated_series = translate_canonical_series_to_internal(series)
+
+            # if not self.validate_internal_translated_series(translated_series):
+            #     print("[TELEM LLM] translated series validation failed", flush=True)
+            #     return None
+
+            base = time.monotonic()
+
+            with self.override_lock:
+                self.override_series.clear() # new 2 | commented for telemetry patch
+                for step in translated_series:
+                    self.override_series.append({
+                        "apply_at": base + float(step["dt"]),
+                        "fields": step["fields"],
+                    })
+
+            print(f"[TELEM SERIES SCHEDULED] steps={len(self.override_series)}", flush=True)
+            return parsed
+
+        except Exception as e:
+            print(f"[TELEM LLM ERROR] {e}", flush=True)
+            return None
+
+    def validate_telemetry_response(self, response: dict) -> bool:
+        if not isinstance(response, dict):
+            print("[TELEM VERIFY FAIL] response is not dict", flush=True)
+            return False
+
+        series = response.get("telemetry_series")
+        if not isinstance(series, list):
+            print("[TELEM VERIFY FAIL] telemetry_series missing or not list", flush=True)
+            return False
+
+        if len(series) != 5:
+            print("[TELEM VERIFY FAIL] telemetry_series must have 5 steps", flush=True)
+            return False
+
+        # expected_dts = [0.0, 0.1, 0.2, 0.3, 0.4]
+        expected_dts = [0.5, 1.0, 1.5, 2.0, 2.5]
+
+
+        for i, step in enumerate(series):
+            if not isinstance(step, dict):
+                print("[TELEM VERIFY FAIL] step is not dict", flush=True)
+                return False
+
+            if "dt" not in step or "fields" not in step:
+                print("[TELEM VERIFY FAIL] step missing dt or fields", flush=True)
+                return False
+
+            try:
+                dt = round(float(step["dt"]), 1)
+            except Exception:
+                print("[TELEM VERIFY FAIL] dt is not numeric", flush=True)
+                return False
+
+            if dt != expected_dts[i]:
+                print(f"[TELEM VERIFY FAIL] bad dt at index {i}: {dt}", flush=True)
+                return False
+
+            fields = step["fields"]
+            if not isinstance(fields, dict):
+                print("[TELEM VERIFY FAIL] fields is not dict", flush=True)
+                return False
+
+            for msg_name, msg_fields in fields.items():
+                if msg_name not in TELEM_GROUPS_SET:
+                    print(f"[TELEM VERIFY FAIL] invalid message group: {msg_name}", flush=True)
+                    return False
+
+                if not isinstance(msg_fields, dict):
+                    print(f"[TELEM VERIFY FAIL] fields for {msg_name} must be dict", flush=True)
+                    return False
+
+                allowed_fields = TELEM_GROUPS_SET[msg_name]
+
+                for field_name in msg_fields.keys():
+                    if field_name not in allowed_fields:
+                        print(f"[TELEM VERIFY FAIL] invalid field {msg_name}.{field_name}", flush=True)
+                        return False
+
+        return True
+
+    # for telemetry based on commands /////////
+    def handle_inbound_msg(self, msg):
+        """
+        # Handles inbound MAVLink messages from the GCS.
+
+        # Priority order:
+        # 1) Telemetry stream control (SET_MESSAGE_INTERVAL / MAV_CMD_SET_MESSAGE_INTERVAL)
+        # - handled immediately
+        # - always ACKed (ACCEPTED if supported else UNSUPPORTED)
+        # - NEVER sent to the LLM
+
+        # 2) Other COMMAND_LONG commands
+        # - ACK immediately (so GCS sees a response)
+        # - optionally send to LLM to generate state_patch + telemetry_series
+        # - apply patch to state (which affects subsequent telemetry + heartbeat)
+
+        update: Full patched handler:
+        - Stream control (SET_MESSAGE_INTERVAL / MAV_CMD_SET_MESSAGE_INTERVAL): handled locally, ACKed, NOT sent to LLM
+        #- Other COMMAND_LONG: logged -> LLM (llm_prompt_command) -> apply_llm_command_result (ACK + patches + schedule series)
+        - Everything else: ignore (or extend later)
+            """
+        msg_type = msg.get_type()
+        attacker_msg = {"type": msg_type}
+
+        ts = int(getattr(msg, "get_srcSystem", lambda: 255)())
+        tc = int(getattr(msg, "get_srcComponent", lambda: 190)())
+
+
+        # the - mission 
+        if msg_type == "MISSION_COUNT":
+            handle_mission_count(self, msg)
+            return
+
+        if msg_type in ("MISSION_ITEM_INT", "MISSION_ITEM"):
+            handle_mission_item(self, msg)
+            if mission_upload_complete(self):
+                finalize_mission_upload(self)
+            return
+
+        # if msg_type == "SET_MODE":
+        #     base_mode = int(getattr(msg, "base_mode", 0))
+        #     custom_mode = int(getattr(msg, "custom_mode", 0))
+
+        #     print(f"[SET_MODE RX] base_mode={base_mode} custom_mode={custom_mode}", flush=True)
+
+        #     with self.state_lock:
+        #         self.state.base_mode = base_mode
+        #         self.state.custom_mode = custom_mode
+
+        #     return
+
+        # handle land and RTL without even mission: jul 2026
+        if msg_type == "SET_MODE":
+            base_mode = int(getattr(msg, "base_mode", 0))
+            custom_mode = int(getattr(msg, "custom_mode", 0))
+
+            with self.state_lock:
+                self.state.base_mode = base_mode
+                self.state.custom_mode = custom_mode
+
+            main = (custom_mode >> 16) & 0xFF
+            sub  = (custom_mode >> 24) & 0xFF
+
+            cmd = {
+                (4, 6): 21,  # AUTO LAND
+                (4, 5): 20,  # AUTO RTL
+            }.get((main, sub))
+
+            if cmd is not None:
+                params = {f"param{i}": 0.0 for i in range(1, 8)}
+
+                # RTL target: saved home and current altitude
+                if cmd == 20 and self.home:
+                    with self.state_lock:
+                        params["param5"] = float(self.home["lat"])
+                        params["param6"] = float(self.home["lon"])
+                        params["param7"] = self.state.gpi_relative_alt / 1000.0
+
+                self.direct_cmd = cmd
+                self.direct_params = params
+
+                with self.override_lock:
+                    self.override_series.clear()
+
+                self.handle_command_telemetry(cmd, params)
+
+            return
+        # the - mission 
+
+
+        # ------------------------------------------------------------
+        # (A) Direct SET_MESSAGE_INTERVAL message
+        # ------------------------------------------------------------
+        if msg_type == "SET_MESSAGE_INTERVAL":
+            msg_id = int(getattr(msg, "message_id", -1))
+            interval_us = int(getattr(msg, "interval_us", 0))
+
+            handled = self._apply_message_interval_request(msg_id, interval_us)
+
+            # Some GCS don't require ACK for SET_MESSAGE_INTERVAL,
+            # but sending COMMAND_ACK for MAV_CMD_SET_MESSAGE_INTERVAL is harmless if you want.
+            # We'll keep it quiet here to avoid confusing GCS tooling.
+            return
+
+        #  ////////// QGC ///////////////////////////////////////
+        if msg_type == "PARAM_REQUEST_LIST":
+            print("[PARAM] REQUEST_LIST -> sending params", flush=True)
+            self._send_all_params()
+            return
+
+        if msg_type == "PARAM_REQUEST_READ":
+            idx = int(getattr(msg, "param_index", -1))
+            pid = getattr(msg, "param_id", b"")
+
+            try:
+                pname = pid.decode("ascii", errors="ignore").strip("\x00").strip()
+            except Exception:
+                pname = ""
+
+            if 0 <= idx < len(self.params):
+                name, val, ptype = self.params[idx]
+                print(f"[PARAM] REQUEST_READ idx={idx} -> {name}", flush=True)
+                self._send_param_value(name, val, ptype, idx, len(self.params))
+                return
+
+            if pname and pname in self.param_index:
+                i = self.param_index[pname]
+                name, val, ptype = self.params[i]
+                print(f"[PARAM] REQUEST_READ name={pname} -> {name}", flush=True)
+                self._send_param_value(name, val, ptype, i, len(self.params))
+                return
+
+            print(f"[PARAM] REQUEST_READ unknown idx={idx} name={pname!r}", flush=True)
+            return
+        #  ////////// QGC /////////////////////////////
+
+        # ------------------------------------------------------------
+        # (B) COMMAND_LONG: may include MAV_CMD_SET_MESSAGE_INTERVAL
+        # ------------------------------------------------------------
+        # /////////older
+        # if msg_type == "COMMAND_LONG":
+        #     cmd = int(getattr(msg, "command", -1))
+        #     attacker_msg["command"] = cmd
+
+        #     print(f"[COMMAND_LONG RX] cmd={cmd}", flush=True)
+        # /////////older -- before had only command long
+
+
+        # ///////new handled long and int
+        if msg_type in ("COMMAND_LONG", "COMMAND_INT"):
+            cmd = int(getattr(msg, "command", -1))
+            is_int = msg_type == "COMMAND_INT"
+
+            params = {
+                **{f"param{i}": float(getattr(msg, f"param{i}", 0)) for i in range(1, 5)},
+                "param5": int(getattr(msg, "x", 0)) if is_int else float(getattr(msg, "param5", 0)),
+                "param6": int(getattr(msg, "y", 0)) if is_int else float(getattr(msg, "param6", 0)),
+                "param7": float(getattr(msg, "z", 0)) if is_int else float(getattr(msg, "param7", 0)),
+            }
+
+            # Normalize COMMAND_LONG coordinates to the same ×1e7 format as COMMAND_INT.
+            if not is_int and cmd in {16, 21, 22, 192}:
+                for k in ("param5", "param6"):
+                    if math.isfinite(params[k]) and abs(params[k]) <= 180:
+                        params[k] = round(params[k] * 1e7)
+
+            attacker_msg["command"] = cmd
+            print(f"[{msg_type} RX] cmd={cmd} params={params}", flush=True)
+        # ///////new handled long and int
+
+            # the - mission
+            if cmd == mavutil.mavlink.MAV_CMD_MISSION_START:
+                ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
+                    int(cmd),
+                    int(mavutil.mavlink.MAV_RESULT_ACCEPTED)
+                )
+                print('reached command')
+                self.send_mav(ack_msg)
+                start_mission(self)
+                return
+
+            if cmd == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+                base_mode = int(getattr(msg, "param1", 0))
+                custom_mode = int(getattr(msg, "param2", 0))
+
+                print(f"[DO_SET_MODE RX] base_mode={base_mode} custom_mode={custom_mode}", flush=True)
+
+                with self.state_lock:
+                    self.state.base_mode = base_mode
+                    self.state.custom_mode = custom_mode
+
+                ack = self.mav_out.command_ack_encode(
+                    cmd,
+                    mavutil.mavlink.MAV_RESULT_ACCEPTED
+                )
+                self.send_mav(ack)
+                return
+            # the - mission 
+
+            # ---------------------------
+            # B1) Telemetry stream request
+            # ---------------------------
+            if cmd == mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL:
+                # param1 = message_id, param2 = interval_us (often floats)
+                msg_id = int(round(float(getattr(msg, "param1", -1.0))))
+                interval_us = int(round(float(getattr(msg, "param2", 0.0))))
+
+                handled = self._apply_message_interval_request(msg_id, interval_us)
+
+                # ack = self.mav_out.command_ack_encode( #commented for ack handling
+                #     mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, #commented for ack handling
+                #     mavutil.mavlink.MAV_RESULT_ACCEPTED if handled else mavutil.mavlink.MAV_RESULT_UNSUPPORTED #commented for ack handling
+                # ) #commented for ack handling
+                # self.send_mav(ack) #commented for ack handling
+
+                ack = self.mav_out.command_ack_encode(
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    mavutil.mavlink.MAV_RESULT_ACCEPTED if handled else mavutil.mavlink.MAV_RESULT_UNSUPPORTED                    # ,0,  # progress
+                    # 0,  # result_param2
+                    # ts, # target_system
+                    # tc  # target_component
+                    )
+                self.send_mav(ack)
+                return
+            # ---------------------------
+            # B2) Request handling #new///
+            # ---------------------------
+            if cmd == mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE:
+                requested_msg_id = int(round(float(getattr(msg, "param1", -1.0))))
+                requested_name = self._msg_name_from_id(requested_msg_id)
+
+                print(f"[REQ MESSAGE] msg_id={requested_msg_id} name={requested_name}", flush=True)
+
+                if requested_name == "HEARTBEAT":
+                    with self.state_lock:
+                        update_time_fields(self.state, self.boot_time)
+                        out_msg = make_heartbeat(self.mav_out, self.state)
+
+                    self.send_mav(out_msg)
+                    print("[REQ MESSAGE SENT] HEARTBEAT", flush=True)
+
+                    ack = self.mav_out.command_ack_encode(
+                        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                        mavutil.mavlink.MAV_RESULT_ACCEPTED
+                    )
+                    self.send_mav(ack)
+                    return
+
+                builder = TELEM_BUILDERS.get(requested_name)
+                if builder:
+                    try:
+                        with self.state_lock:
+                            update_time_fields(self.state, self.boot_time)
+                            out_msg = builder(self.mav_out, self.state)
+
+                        self.send_mav(out_msg)
+                        print(f"[REQ MESSAGE SENT] {requested_name}", flush=True)
+
+                        ack = self.mav_out.command_ack_encode(
+                            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                            mavutil.mavlink.MAV_RESULT_ACCEPTED
+                        )
+                        self.send_mav(ack)
+                    except Exception as e:
+                        print(f"[REQ MESSAGE ERROR] msg_id={requested_msg_id} name={requested_name} err={e}", flush=True)
+                        ack = self.mav_out.command_ack_encode(
+                            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                            mavutil.mavlink.MAV_RESULT_UNSUPPORTED
+                        )
+                        self.send_mav(ack)
+                else:
+                    print(f"[REQ MESSAGE UNSUPPORTED] msg_id={requested_msg_id} name={requested_name}", flush=True)
+                    ack = self.mav_out.command_ack_encode(
+                        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                        mavutil.mavlink.MAV_RESULT_UNSUPPORTED
+                    )
+                    self.send_mav(ack)
+                return
+            # ---------------------------
+            # B3) Other commands (ARM/DISARM/TAKEOFF/etc.)
+            # ---------------------------
+
+            # ///////// new cmd long/int setup do not need this-------------
+            # # --- B2) All other commands: route to LLM command pipeline ---
+            # params = {
+            #     "param1": float(getattr(msg, "param1", 0.0)),
+            #     "param2": float(getattr(msg, "param2", 0.0)),
+            #     "param3": float(getattr(msg, "param3", 0.0)),
+            #     "param4": float(getattr(msg, "param4", 0.0)),
+            #     "param5": float(getattr(msg, "param5", 0.0)),
+            #     "param6": float(getattr(msg, "param6", 0.0)),
+            #     "param7": float(getattr(msg, "param7", 0.0)),
+            # }
+            # ///////// new cmd long/int setup do not need this-----------
+
+            # ---- NEW: rule-based ACK ----
+            # result, reason= rule_based_ack(cmd, params, self.state)
+
+            with self.state_lock: # automaton new
+                result, reason, execute = rule_based_ack( cmd, params, self.state, with_effect=True)
+            
+            result_name = mavutil.mavlink.enums["MAV_RESULT"][int(result)].name #debug
+            print(f"[ACK RULE] cmd={cmd} result={result_name} reason={reason}", flush=True) #debug
+
+
+            ack_msg = mavutil.mavlink.MAVLink_command_ack_message(
+                int(cmd), int(result)
+            )
+            print(f"[ACK TX] cmd={cmd} result={result}", flush=True)
+            self.send_mav(ack_msg)          
+
+            # if ack then prompt else not. #new
+            # # ✅ ADD THIS CONDITION
+            # if result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            #     print(f"[LLM SKIPPED] cmd={cmd} because ACK={result}", flush=True)
+            #     return
+            # replacing with logging rx_ other than accepted---- jul 2026
+            if result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                if cmd not in self.no_continuation_cmds:
+                    os.makedirs("logs", exist_ok=True)
+                    with open("logs/rx_other.jsonl", "a") as f:
+                        f.write(json.dumps({
+                            "ts": time.time(),
+                            "type": msg_type,
+                            "cmd": cmd,
+                            "params": params,
+                            "result": int(result),
+                            "reason": reason
+                        }) + "\n")
+
+                print(f"[LLM SKIPPED] cmd={cmd} because ACK={result}", flush=True)
+                return
+            # replacing with logging rx_ other than accepted---- jul 2026            
+
+            # THIS NEW BLOCK HERE: #new for ack_automata.
+            if not execute:
+                print(
+                    f"[LLM SKIPPED] cmd={cmd}: accepted without new action; "
+                    f"reason={reason}",
+                    flush=True
+                )
+                return
+
+
+            # Store home when ARM is accepted # raw rtl #new
+            if cmd == 400 and int(round(params["param1"])) == 1:
+                with self.state_lock:
+                    self.home = {
+                        "lat": int(self.state.gpi_lat),
+                        "lon": int(self.state.gpi_lon),
+                    }# raw rtl #new
+            if cmd == 179:
+                with self.state_lock:
+                    self.home = {
+                        "lat": int(self.state.gpi_lat if int(params["param1"]) == 1 else params["param5"]),
+                        "lon": int(self.state.gpi_lon if int(params["param1"]) == 1 else params["param6"]),
+                    }
+
+                print(f"[HOME SET] lat={self.home['lat']} lon={self.home['lon']}", flush=True)
+                return # new set home ;;;
+
+
+            print(f"[HOME STORED] lat={self.home['lat']} lon={self.home['lon']}",flush=True) # new debug home 
+
+            # QGC-critical state update # new jul
+            self.apply_qgc_flight_state_from_cmd(cmd, params)
+
+            #  pending: log the ack as well:
+
+
+            # # new 2 | telemetry patch
+            # self.active_cmd = cmd
+            # self.active_params = params
+            # # new 2 | telemetry patch
+
+
+            # log command into history (so LLM sees it next time)
+            self.hist.add_cmd(cmd, params)
+
+
+            # minimal runtime log (easy to see in terminal)
+            print(f"[CMD RX] id={cmd} params={params}", flush=True)
+
+            # optional persistent log (recommended)
+            try:
+                # with open("cmd_rx_log.jsonl", "a") as f:
+                with open("logs/cmd_rx_log.jsonl", "a") as f:
+                    f.write(json.dumps({"ts": time.time(), "cmd": cmd, "params": params}) + "\n")
+            except Exception as e:
+                print(f"[CMD LOG ERROR] {e}", flush=True)
+
+            if cmd in self.no_continuation_cmds: #new replacement from////
+                print(f"[LLM SKIP] cmd={cmd}", flush=True)
+                return
+
+            #  cont. telem
+            self.direct_cmd, self.direct_params = cmd, dict(params)
+
+            with self.override_lock:
+                self.override_series.clear()
+            #  cont. telem
+
+
+            # # 1) heartbeat-only LLM module
+            # hb_resp = self.handle_command_heartbeat(cmd, params)
+
+            # if cmd == 400: self.direct_cmd = self.direct_params = None; return # custom : avoid 400 for telem ; jul 2026 #new
+
+            # # 2) telemetry module will be added later
+            # telem_resp = self.handle_command_telemetry(cmd, params)
+            self.start_cmd(cmd, params)
+
+            return
+
+        # ------------------------------------------------------------
+        # Other message types (optional: track or ignore)
+        # ------------------------------------------------------------
+        return
+        # ////////////// telemetry /////////////////////
+
+
+    def tick_direct_command(self): # cont telem
+        if self.mission_state["active"] or self.direct_cmd is None:
+            return
+
+        with self.override_lock:
+            if self.override_series:
+                return
+
+        self.handle_command_telemetry(
+            self.direct_cmd,
+            self.direct_params
+        )
+
+
+    # ---------------------------
+    # run()  (Main loop)
+    # ---------------------------
+    def run(self):
+
+        # threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+
+
+        # ///////////// HEARTBEAT /////////////////////////
+        # 1️⃣ Initialize identity
+        self.initialize_heartbeat_identity()
+
+        # 2️⃣ Start heartbeat thread
+        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+        # ///////////// HEARTBEAT /////////////////////////
+
+
+        # 3️⃣ Start request-driven telemetry scheduler
+        self.telemetry_thread.start()
+        self.enable_default_telem_streams() # new ///
+
+        while True:
+
+            # the - mission
+            maybe_start_uploaded_mission(self)
+            start_or_tick_mission(self)
+            # the - mission
+
+            self.tick_direct_command() # cont telem | jul 2026
+
+            #replaced new
+            # try:
+            #     data, addr = self.sock.recvfrom(4096)
+            #     # print("[RX UDP addr]", addr, "len=", len(data), flush=True) ##debug dlt later
+            # except socket.timeout:
+            #     continue
+
+            # # GCS detection
+            # if self.gcs_addr is None:
+            #     self.gcs_addr = addr
+            #     print(f"[GCS CONNECTED] {self.gcs_addr}")
+            #replaced new
+
+            # #replaced new
+            # data, addr = self.connection.receive(4096)
+            # if data is None:
+            #     continue
+            # self.connection.set_gcs_addr(addr) 
+            # #new
+
+            # # MAVLink parsing
+            # for byte in data:
+            #     msg = self.mav_in.parse_char(bytes([byte]))
+            #     if msg:
+            #         self.handle_inbound_msg(msg)
+            # #replaced new
+
+            messages, addr = self.connection.receive_mav(4096)
+
+            if not messages:
+                continue
+
+            for msg in messages:
+                self.handle_inbound_msg(msg)
