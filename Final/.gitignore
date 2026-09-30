@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local credentials
+api_key.txt
+gemini_api.txt
+
+# Runtime output
+logs/*
+!logs/.gitkeep
+llm_io_log.jsonl
+cmd_rx_log.jsonl
+llm_decision_log.jsonl

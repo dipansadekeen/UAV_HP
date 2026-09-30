@@ -4,6 +4,7 @@ import threading
 import json
 import os, math
 import requests
+from pathlib import Path
 from collections import deque
 from typing import Dict, Any, Optional
 from pymavlink import mavutil
@@ -21,11 +22,11 @@ from module_helper_functions import (
     translate_canonical_series_to_internal,
     TELEM_GROUPS,
     TELEM_GROUPS_SET,
-    rule_based_ack,
+    state_automata_ack,
+
 )
 from module_mission import *
 from module_log import log_mission_llm_csv
-
 from module_rag import (
     retrieve_heartbeat_examples_from_sequences,
     retrieve_telemetry_examples_from_cmd_transition,
@@ -40,24 +41,9 @@ class LLMHoneypot:
     # ---------------------------
     def __init__(self, listen_ip="0.0.0.0", listen_port=14550):
 
-        # self.listen_ip = listen_ip
-        # self.listen_port = listen_port
-        # UDP socket setup  ← from your code
-        # self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # self.sock.bind(("127.0.0.1", 14551)) # for qgc new
-        # self.gcs_addr = ("127.0.0.1", 14550) #for qgc new
-        # self.sock.settimeout(0.2)
-
-        #replaced
         self.connection = UDPConnection(listen_ip="127.0.0.1",listen_port=14551,gcs_ip="127.0.0.1",gcs_port=14550,timeout=0.2,)
 
-        # MAVLink encoder/decoder # replaced new
-        # self.mav_out = mavutil.mavlink.MAVLink(None)
-        # self.mav_out.srcSystem = 1
-        # self.mav_out.srcComponent = 1
-        # self.mav_in = mavutil.mavlink.MAVLink(None)
-
-        # temporary compatibility alias #new
+        #compatibility alias #new
         self.mav_out = self.connection.mav_out #new
 
 
@@ -126,16 +112,12 @@ class LLMHoneypot:
         self.mission_run_id = time.strftime("mission_%Y%m%d_%H%M%S")
         self.mission_name = "qgc_uploaded_mission"
 
-
-        # --- new telemetry-state-aware RAG rows --- || RAG
-        # attach_rag_to_hp(self,transition_path="../out/cmd_transition.jsonl",sequence_path="../out/px4_command_sequences.jsonl")
-
         self.direct_cmd = self.direct_params = None #continous telem | jul 2026 #new
         self.home = None # for raw rtl #new
 
-        self.cmd_token = 0 #threading commands so new cmd can interrupt -- new new command override
+        self.cmd_token = 0 #command override for new cmd intrupt
 
-    def start_cmd(self, cmd, params): #threading commands so new cmd can interrupt -- new command override
+    def start_cmd(self, cmd, params): #command override for new cmd intrupt
         self.cmd_token += 1
         with self.override_lock:
             self.override_series.clear()
@@ -146,7 +128,7 @@ class LLMHoneypot:
                 cmd != 400 and self.handle_command_telemetry(cmd, params)
             ),
             daemon=True
-        ).start() #threading commands so new cmd can interrupt -- new
+        ).start() #command override for new cmd intrupt
 
     # to translate the commands # example: name : MAV_CMD_COMPONENT_ARM_DISARM -- giving enums to the model
     def get_command_name(self, command_id: int) -> str:
@@ -183,12 +165,6 @@ class LLMHoneypot:
     # ---------------------------
     # send_mav()  (GCS TX)
     # ---------------------------
-    # def send_mav(self, msg):
-    #     if not self.gcs_addr:
-    #         return
-    #     pkt = msg.pack(self.mav_out)
-    #     self.sock.sendto(pkt, self.gcs_addr)
-    #     # print(f"[SEND_MAV] dst={self.gcs_addr} bytes={len(pkt)}", flush=True)
 
     # def send_mav(self, msg): #replaced new
     #     pkt = msg.pack(self.mav_out)
@@ -203,28 +179,17 @@ class LLMHoneypot:
         while True:
             # if self.gcs_addr: #new replaced
             if self.connection.gcs_addr: #new
-                update_time_fields(self.state, self.boot_time)               
-    #  to make llm give heartbeat all the time | uncomment below ////////////////////////
-                # response = self.llm_prompt({"event": "heartbeat_tick"},context_type="heartbeat")
-                # if response and self.verify_response(response):
-                #     self.llm_output_process(response)
-    #  to make llm give heartbeat all the time ////////////////////////
-                # log last heartbeat snapshot (for LLM prompt)               
+                update_time_fields(self.state, self.boot_time)                      
                 hb = make_heartbeat(self.mav_out, self.state)
-                # print(
-                #     "[HEARTBEAT TX]", "base_mode=", int(self.state.base_mode),
-                #     "custom_mode=", int(self.state.custom_mode), "system_status=", int(self.state.system_status),
-                #     "armed=", bool(self.state.base_mode & 0x80),flush=True) # debug delete later dlt
-
                 self.send_mav(hb)
-                with self.state_lock: # log last 10 hb
+                with self.state_lock:
                     self.hist.add_hb(self.state) # log last hb (for LLM prompt)
             time.sleep(1)
 
 
     def initialize_heartbeat_identity(self):
         """
-        Call LLM once to initialize heartbeat identity.
+        Call LLM to initialize heartbeat identity.
         """
 
         response = self.llm_prompt({"event": "startup_identity"})
@@ -667,7 +632,6 @@ class LLMHoneypot:
             # -------------------------
             # 2 Call model
             # -------------------------
-
             raw = call_ollama(self, system_text, user_text)
 
             # -------------------------
@@ -684,9 +648,6 @@ class LLMHoneypot:
         except Exception as e:
             print(f"[LLM ERROR] {e}")
             return None
-
-
-
 
     def verify_response(self, response: dict) -> bool:
 
@@ -882,40 +843,7 @@ class LLMHoneypot:
         # last_telem = last_telem[-1] if last_telem else None
         # cmd_name = self.get_command_name(command_id)
 
-        system_text = """
-        You are a MAVLink heartbeat patch generator for a drone honeypot.
-
-        You are given:
-        - the current command
-        - the current previous heartbeat
-        - a few command-centered heartbeat transition examples from past traces
-
-        Your task:
-        - compare the current command with the examples
-        - start from previous_heartbeat
-        - produce only the immediate next heartbeat patch
-
-        Return ONLY valid JSON in exactly this format:
-        {
-        "heartbeat_patch": {
-            "base_mode": <int>,
-            "custom_mode": <int>,
-            "system_status": <int>
-        },
-        "reason": "<short>"
-        }
-
-        Rules:
-        - Do NOT invent a new heartbeat from scratch.
-        - Start from previous_heartbeat.
-        - Use the fewshot transition examples to infer whether this command changes heartbeat.
-        - If examples do not show a heartbeat-changing effect, preserve previous heartbeat.
-        - Only command 400 may change the armed bit in base_mode.
-        - For commands other than 400, preserve the armed bit exactly.
-        - heartbeat_patch must contain exactly: base_mode, custom_mode, system_status.
-        - Do not output hb_type, hb_autopilot, mavlink_version, or telemetry fields.
-        - Return JSON only.
-        """.strip()
+        system_text = (Path(__file__).resolve().parent /"prompts"/"heartbeat_prompt.txt").read_text(encoding="utf-8").strip()
 
         user_payload = {
             "command": {
@@ -945,9 +873,6 @@ class LLMHoneypot:
         try:
             print("\n[HB LLM USER PROMPT]")
             print(user_text, flush=True) # view llm prompt
-
-            # raw = self.call_ollama(system_text, user_text, tag="heartbeat_command") #original
-            # raw = self.call_ollama_cloud(system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
 
             # raw = call_ollama_cloud(self, system_text, user_text, tag="heartbeat_command") # *heartbeat cloud
             raw = call_ollama(self, system_text, user_text, tag="heartbeat_command") 
@@ -1122,91 +1047,7 @@ class LLMHoneypot:
         print("[--DEBUG--] sequence_examples =", len(sequence_examples))
         cmd_name = self.get_command_name(command_id)
 
-        system_text = """
-        You are a MAVLink telemetry predictor for a drone honeypot.
-
-        You are given:
-        - the current command
-        - the current heartbeat
-        - the most recent live telemetry context
-        - transition examples from past traces
-        - short future telemetry examples from past traces
-        - the allowed telemetry schema
-
-        Your task:
-        - generate the next 5 telemetry states after this command
-        - use only canonical MAVLink telemetry names
-        - group telemetry by MAVLink message name
-        - follow the allowed telemetry schema exactly
-        - keep the sequence physically consistent and smooth
-        - preserve continuity from the latest telemetry state
-
-        Return ONLY valid JSON in exactly this format:
-        {
-        "telemetry_series": [
-            {"dt": 0.5, "fields": {}},
-            {"dt": 1.0, "fields": {}},
-            {"dt": 1.5, "fields": {}},
-            {"dt": 2.0, "fields": {}},
-            {"dt": 2.5, "fields": {}}
-        ],
-        "reason": "<short>"
-        }
-
-        Rules:
-        - Only use message groups and fields defined in allowed_telemetry_groups.
-        - Do not use internal or private variable names.
-        - Keep all changes smooth, realistic, and temporally consistent.
-        - The first telemetry state at dt=0.5 must begin from the latest available telemetry state.
-        - Use examples only to learn which fields change and the style of change. Never copy absolute values.
-        - Always include SYS_STATUS.battery_remaining.
-        - If a field does not need to change, keep it unchanged or omit it.
-        - Keep telemetry internally consistent across message groups.
-        - Beware of the altitude
-
-        Command-specific behavior:
-        - ARM/DISARM (400): may change armed-related behavior, but must not simulate takeoff unless a takeoff command is given.
-        - TAKEOFF (22): perform a smooth vertical climb. Horizontal movement should remain minimal. Relative altitude must increase toward the target altitude.
-        - WAYPOINT (16): move smoothly toward target latitude and longitude while maintaining target altitude.
-        - LAND (21): descend smoothly toward ground with minimal horizontal movement.
-        - Return to Launch (20): like WAYPOINT you have to reach to coordinates.
-        
-        For WAYPOINT (16):
-        - Move in a straight line from current position to the target position.
-        - At every step, reduce the distance to the target.
-        - Do not move sideways or away from the direct path.
-        - If any drift occurs, correct the direction back toward the straight path.
-        - Maintain smooth and consistent velocity toward the target.
-
-        Completion requirement:
-        - The generated 5-step sequence must move the drone toward the command target.
-        - If the target is reachable within 5 steps, fully complete it.
-        - If the target is not realistically reachable within 5 steps, make strong, consistent progress toward it without unrealistic jumps.
-        - Do not overshoot and reverse direction within the same 5 steps.
-
-        Consistency requirements:
-        - GLOBAL_POSITION_INT.relative_alt and VFR_HUD.alt must follow the same trend.
-        - If altitude increases, climb should be positive or zero.
-        - If altitude decreases, climb should be negative or zero.
-        - Do not abruptly change direction unless already indicated by current telemetry.
-        - Keep velocity, altitude, and heading changes smooth and consistent.
-
-        Kinematic realism:
-        - First update position: GLOBAL_POSITION_INT.lat/lon/relative_alt and VFR_HUD.alt.
-        - VFR_HUD.alt is meters; GLOBAL_POSITION_INT.relative_alt is millimeters, so relative_alt = VFR_HUD.alt × 1000.
-        - For normal waypoint flight, choose groundspeed around 8–10.
-        - For takeoff/landing, keep horizontal groundspeed low, around 0 m/s.
-        - If groundspeed is 0, lat/lon must not change.
-        - If the waypoint is closer than the allowed movement, slow down and stop at the target.
-        - vx/vy/vz must describe the same movement shown by lat/lon/altitude. Use cm/s integers.
-        - VFR_HUD.heading must point in the same direction as lat/lon movement.
-        - GLOBAL_POSITION_INT.hdg = VFR_HUD.heading × 100.
-        - ATTITUDE.yaw must match heading in radians.
-        - Pitch should be near 0, slightly positive during climb, and slightly negative during descent.
-        - Roll should be near 0 unless the drone is turning.
-        
-        Return JSON only.
-        """.strip()
+        system_text = (Path(__file__).resolve().parent / "prompts" / "telemetry_prompt.txt").read_text(encoding="utf-8").strip()
         user_payload = {
             "command": {
                 "id": int(command_id),
@@ -1329,7 +1170,6 @@ class LLMHoneypot:
             print("[TELEM VERIFY FAIL] telemetry_series must have 5 steps", flush=True)
             return False
 
-        # expected_dts = [0.0, 0.1, 0.2, 0.3, 0.4]
         expected_dts = [0.5, 1.0, 1.5, 2.0, 2.5]
 
 
@@ -1584,12 +1424,6 @@ class LLMHoneypot:
 
                 handled = self._apply_message_interval_request(msg_id, interval_us)
 
-                # ack = self.mav_out.command_ack_encode( #commented for ack handling
-                #     mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, #commented for ack handling
-                #     mavutil.mavlink.MAV_RESULT_ACCEPTED if handled else mavutil.mavlink.MAV_RESULT_UNSUPPORTED #commented for ack handling
-                # ) #commented for ack handling
-                # self.send_mav(ack) #commented for ack handling
-
                 ack = self.mav_out.command_ack_encode(
                     mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                     mavutil.mavlink.MAV_RESULT_ACCEPTED if handled else mavutil.mavlink.MAV_RESULT_UNSUPPORTED                    # ,0,  # progress
@@ -1657,24 +1491,10 @@ class LLMHoneypot:
             # B3) Other commands (ARM/DISARM/TAKEOFF/etc.)
             # ---------------------------
 
-            # ///////// new cmd long/int setup do not need this-------------
-            # # --- B2) All other commands: route to LLM command pipeline ---
-            # params = {
-            #     "param1": float(getattr(msg, "param1", 0.0)),
-            #     "param2": float(getattr(msg, "param2", 0.0)),
-            #     "param3": float(getattr(msg, "param3", 0.0)),
-            #     "param4": float(getattr(msg, "param4", 0.0)),
-            #     "param5": float(getattr(msg, "param5", 0.0)),
-            #     "param6": float(getattr(msg, "param6", 0.0)),
-            #     "param7": float(getattr(msg, "param7", 0.0)),
-            # }
-            # ///////// new cmd long/int setup do not need this-----------
-
-            # ---- NEW: rule-based ACK ----
-            # result, reason= rule_based_ack(cmd, params, self.state)
+            # result, reason= state_automata_ack(cmd, params, self.state)
 
             with self.state_lock: # automaton new
-                result, reason, execute = rule_based_ack( cmd, params, self.state, with_effect=True)
+                result, reason, execute = state_automata_ack( cmd, params, self.state, with_effect=True)
             
             result_name = mavutil.mavlink.enums["MAV_RESULT"][int(result)].name #debug
             print(f"[ACK RULE] cmd={cmd} result={result_name} reason={reason}", flush=True) #debug
@@ -1742,14 +1562,6 @@ class LLMHoneypot:
             # QGC-critical state update # new jul
             self.apply_qgc_flight_state_from_cmd(cmd, params)
 
-            #  pending: log the ack as well:
-
-
-            # # new 2 | telemetry patch
-            # self.active_cmd = cmd
-            # self.active_params = params
-            # # new 2 | telemetry patch
-
 
             # log command into history (so LLM sees it next time)
             self.hist.add_cmd(cmd, params)
@@ -1777,14 +1589,6 @@ class LLMHoneypot:
                 self.override_series.clear()
             #  cont. telem
 
-
-            # # 1) heartbeat-only LLM module
-            # hb_resp = self.handle_command_heartbeat(cmd, params)
-
-            # if cmd == 400: self.direct_cmd = self.direct_params = None; return # custom : avoid 400 for telem ; jul 2026 #new
-
-            # # 2) telemetry module will be added later
-            # telem_resp = self.handle_command_telemetry(cmd, params)
             self.start_cmd(cmd, params)
 
             return
@@ -1839,33 +1643,6 @@ class LLMHoneypot:
             # the - mission
 
             self.tick_direct_command() # cont telem | jul 2026
-
-            #replaced new
-            # try:
-            #     data, addr = self.sock.recvfrom(4096)
-            #     # print("[RX UDP addr]", addr, "len=", len(data), flush=True) ##debug dlt later
-            # except socket.timeout:
-            #     continue
-
-            # # GCS detection
-            # if self.gcs_addr is None:
-            #     self.gcs_addr = addr
-            #     print(f"[GCS CONNECTED] {self.gcs_addr}")
-            #replaced new
-
-            # #replaced new
-            # data, addr = self.connection.receive(4096)
-            # if data is None:
-            #     continue
-            # self.connection.set_gcs_addr(addr) 
-            # #new
-
-            # # MAVLink parsing
-            # for byte in data:
-            #     msg = self.mav_in.parse_char(bytes([byte]))
-            #     if msg:
-            #         self.handle_inbound_msg(msg)
-            # #replaced new
 
             messages, addr = self.connection.receive_mav(4096)
 

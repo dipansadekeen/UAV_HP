@@ -842,7 +842,7 @@ def _alt_m(state) -> float:
         return float(getattr(state, "gps_alt", 0)) / 1000.0
     return 0.0
 
-# def rule_based_ack(cmd, params, state):
+# def state_automata_ack(cmd, params, state):
 #     alt = _alt_m(state)
 #     armed = _is_armed(state)
 
@@ -903,7 +903,7 @@ def _alt_m(state) -> float:
 
 #     return mavutil.mavlink.MAV_RESULT_UNSUPPORTED, "unsupported command"
 
-def rule_based_ack(cmd, params, state, *, with_effect=False):
+def state_automata_ack(cmd, params, state, *, with_effect=False):
     """
     Table-driven command-decision automaton (EFSM).
 
@@ -1194,7 +1194,7 @@ def rule_based_ack(cmd, params, state, *, with_effect=False):
 
     raise RuntimeError("Automaton has no matching transition")
 
-# def rule_based_ack(cmd, params, state):
+# def state_automata_ack(cmd, params, state):
 #     """
 #     ACK decision using the learned finite-state automaton.
 
